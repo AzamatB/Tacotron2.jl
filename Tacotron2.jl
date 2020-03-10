@@ -63,7 +63,7 @@ end
 
 # Flux.reset!(m::BLSTM) = reset!((m.forward, m.backward)) # not needed as taken care of by @functor
 
-include("dataprepLJSpeech/dataprepLJSpeech.jl")
+include("dataprepLJSpeech/dataprep.jl")
 
 struct CharEmbedding{M <: DenseMatrix, D <: AbstractDict}
    alphabet  :: D
@@ -88,9 +88,7 @@ getindices(dict::AbstractDict, chars) = getindex.((dict,), chars)
 function (m::CharEmbedding)(textsbatch::AbstractVector)
    indices = getindices.((m.alphabet,), textsbatch)
    embeddings = bufferfrom(Array{Float32}(undef, size(m.embedding,1), length(first(textsbatch)), length(textsbatch)))
-   for (k, idcs) ∈ enumerate(indices)
-      embeddings[:,:,k] = m.embedding[:,idcs]
-   end
+   setindex!.((embeddings,), getindex.((m.embedding,), :, indices), :, :, axes(embeddings,3))
    return copy(embeddings)
 end
 
@@ -106,43 +104,6 @@ textsbatch, y = first(batches)
 m = CharEmbedding(alphabet)
 
 
-
-
-
-function f1(m::CharEmbedding, textsbatch::AbstractVector)
-   indices = getindices.((m.alphabet,), textsbatch)
-   embeddings = bufferfrom(Array{Float32}(undef, size(m.embedding,1), length(first(textsbatch)), length(textsbatch)))
-   for (k, idcs) ∈ enumerate(indices)
-      embeddings[:,:,k] = m.embedding[:,idcs]
-   end
-   return copy(embeddings)
-end
-function f2(m::CharEmbedding, textsbatch::AbstractVector)
-   indices = getindices.((m.alphabet,), textsbatch)
-   embeddings = bufferfrom(Array{Float32}(undef, size(m.embedding,1), length(first(textsbatch)), length(textsbatch)))
-   setindex!.((embeddings,), getindex.((m.embedding,), :, indices), :, :, axes(embeddings,3))
-   return copy(embeddings)
-end
-function g1(θ, m, texts)
-   gradient(θ) do
-      sum(f1(m, texts))
-   end
-end
-function g2(θ, m, texts)
-   gradient(θ) do
-      sum(f2(m, texts))
-   end
-end
-
-θ = Flux.params(m)
-
-g1(θ, m, textsbatch)
-g2(θ, m, textsbatch)
-
-@benchmark f1($m, $textsbatch)
-@benchmark f2($m, $textsbatch)
-@benchmark g1($θ, $m, $textsbatch)
-@benchmark g2($θ, $m, $textsbatch)
 
 
 
