@@ -2,6 +2,7 @@ using Flux
 using Flux: @functor, Recur, LSTMCell
 using Zygote
 using Zygote: Buffer
+using OMEinsum
 
 include("dataprepLJSpeech/dataprep.jl")
 
@@ -114,37 +115,6 @@ end
 
 # Flux.reset!(m::BLSTM) = reset!((m.forward, m.backward)) # not needed as taken care of by @functor
 
-
-datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
-metadatapath = joinpath(datadir, "metadata.csv")
-melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
-
-batch_size = 77
-batches, alphabet = batch_dataset(metadatapath, melspectrogramspath, batch_size)
-texts, targets = first(batches)
-che = CharEmbedding(alphabet)
-cb3 = ConvBlock(3)
-blstm = BLSTM(512, 256)
-
-x = che(texts)
-x = cb3(x)
-x = permutedims(x, (2, 3, 1))
-x = blstm(x)
-values = copy(x)
-hs = values
-L = size(hs,3)
-
-# attention weights
-Σα = attend(s, hs)
-Σα = reshape(softmax(rand(L)), :, 1, 1)
-# glimpse
-g = dropdims(sum(Σα .* hs; dims=2); dims=2)
-
-
-
-conv = Conv((31,), 1=>32, pad = (31-1)÷2)
-conv(Σα)
-
 struct LocationAwareAttention{A <: DenseArray, M <: DenseMatrix, V <: DenseVector, D <: Dense}
    dense :: D # W & b
    pad   :: NTuple{2,Int}
@@ -156,81 +126,72 @@ end
 
 @functor LocationAwareAttention
 
-function LocationAwareAttention(attention_dim=128,
-                                 encoding_dim=512,
-                                 decoding_dim=1024,
-                         location_feature_dim=32)
+function LocationAwareAttention(attention_dim=128, encoding_dim=512, decoding_dim=1024, location_feature_dim=32)
    dense = Dense(decoding_dim, attention_dim)
    convF = Conv((31,), 1=>location_feature_dim, pad = (31-1)÷2)
    denseU = Dense(location_feature_dim, attention_dim)
    denseV = Dense(encoding_dim, attention_dim)
-   densew = Dense(attention_dim,1)
+   densew = Dense(attention_dim, 1)
    LocationAwareAttention(dense, convF.pad, convF.weight, denseU.W, denseV.W, vec(densew.W))
 end
 
-laa = LocationAwareAttention()
+function Base.show(io::IO, l::LocationAwareAttention)
+   attention_dim, decoding_dim = size(l.dense.W)
+   encoding_dim = size(l.V, 2)
+   location_feature_dim = size(l.F, 3)
+   print(io, "LocationAwareAttention($attention_dim, $encoding_dim, $decoding_dim, $location_feature_dim)")
+end
 
-function (laa::LocationAwareAttention)(Σα::DenseArray{<:Real,3}, s::DenseVector, hs)
-dense, F, U, V, w = laa.dense, laa.F, laa.U, laa.V, laa.w
-cdims = DenseConvDims(Σα, F; padding=laa.pad)
-
-f = permutedims(conv(Σα, F, cdims), (2,1,3)) # F✶Σα
-energiesᵢ = w'tanh.(dense(s) .+ V * reshape(hs, size(hs, 1), :) + U * reshape(f, size(f, 1), :))
-αᵢ = softmax(energiesᵢ; dims=2)
+function (laa::LocationAwareAttention)(query::DenseMatrix, values::T, Σweights::T) where T <: DenseArray{<:Real,3}
+   dense, F, U, V, w = laa.dense, laa.F, laa.U, laa.V, laa.w
+   cdims = DenseConvDims(Σweights, F; padding=laa.pad)
+   hs = permutedims(values, (1,3,2)) # [d×b×t] -> [d×t×b]
+   fs = conv(Σweights, F, cdims) # F✶Σα
+   @ein Uf[a,t,b] := U[a,c] * fs[t,c,b] # location keys
+   # check: Uf ≈ reduce(hcat, [reshape(U * fs[t,:,:], size(U,1), 1, :) for t ∈ axes(fs,1)])
+   @ein Vh[a,t,b] := V[a,d] * hs[d,t,b] # memory keys
+   # check: Vh ≈ reduce(hcat, [reshape(V * hs[:,t,:], size(V,1), 1, :) for t ∈ axes(hs,2)])
+   Ws⁺b = reshape(dense(query), size(V,1), 1, :) # (a -> b) & (t -> c -> b)
+   tanhWs⁺Vh⁺Uf⁺b = tanh.(Ws⁺b .+ Vh + Uf)
+   @ein energies[t,b] := w[a] * tanhWs⁺Vh⁺Uf⁺b[a,t,b]
+   # check: energies == reduce(vcat, [w'tanhWs⁺Vh⁺Uf⁺b[:,t,:] for t ∈ axes(tanhWs⁺Vh⁺Uf⁺b,2)])
+   α = softmax(energies)
+   @ein context[d,b] := α[t,b] * hs[d,t,b]
+   # check: context ≈ reduce(hcat, [sum(α[t,b] * hs[:,t,b] for t ∈ axes(hs,2)) for b ∈ axes(hs,3)])
+   return context, reshape(α, size(α,1), 1, :)
 end
 
 
-dense(s)
+datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
+metadatapath = joinpath(datadir, "metadata.csv")
+melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
 
-V
-hs
+batch_size = 77
+batches, alphabet = batch_dataset(metadatapath, melspectrogramspath, batch_size)
+texts, targets = first(batches)
+che = CharEmbedding(alphabet)
+cb3 = ConvBlock(3)
+blstm = BLSTM(512, 256)
+laa = LocationAwareAttention()
 
-U
-
-@edit convF(Σα)
-
-using OMEinsum
-
-
-@ein Uf[a,t,b] := U[a,c] * fs[t,c,b]
-@ein Vh[a,t,b] := V[a,d] * hs[d,b,t]
-
-Ws⁺b = reshape(dense(s), size(V,1), 1, :)
-tanhWs⁺b⁺Vh⁺Uf = tanh.(Ws⁺b .+ Vh + Uf)
-@ein energies[t,b] := w[a] * tanhWs⁺b⁺Vh⁺Uf[a,t,b]
-
-dense(s)
-
-V
-hs
+x = che(texts)
+x = cb3(x)
+x = permutedims(x, (2, 3, 1))
+x = blstm(x)
+context, weights = laa(query, x, Σweights)
 
 
-U
+Σweights += weights
+
+query = rand(Float32, decoding_dim, batch_size)
+Σweights = rand(Float32, size(x, 3), 1, batch_size)
 
 
 
-
-
-
-
-
-
-
-
-ff = conv(Σα, F, cdims)
-
-conv(Σα, F, cdims)
-
-@edit DenseConvDims(Σα, F; padding=laa.pad)
-
-
-
-
-
-Σα = softmax(rand(Float32, L, 1, batch_size))
-s = rand(Float32, decoding_dim, batch_size)
-
-propertynames(convF)
-
-typeof(convF.pad) isa NTuple{2,Int}
-convF.pad isa NTuple{2,Int}
+struct Tacotron2
+   embedchar::CharEmbedding
+   convblock3
+   blstm::BLSTM
+   attend::LocationAwareAttention
+   convblock5
+end
