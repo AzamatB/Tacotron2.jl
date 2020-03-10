@@ -1,0 +1,216 @@
+using Flux
+using Flux: @functor, Recur, LSTMCell
+using Zygote
+using Zygote: Buffer, bufferfrom
+
+"""
+    BLSTM(in::Integer, out::Integer)
+
+Constructs a bidirectional LSTM layer.
+"""
+struct BLSTM{M <: DenseMatrix, V <: DenseVector}
+   forward  :: Recur{LSTMCell{M,V}}
+   backward :: Recur{LSTMCell{M,V}}
+   dim_out  :: Int
+end
+
+@functor BLSTM (forward, backward)
+
+function BLSTM(in::Integer, out::Integer)
+   forward  = LSTM(in, out)
+   backward = LSTM(in, out)
+   return BLSTM(forward, backward, out)
+end
+
+function BLSTM(forward::Recur{LSTMCell{M,V}}, backward::Recur{LSTMCell{M,V}}) where {M <: DenseMatrix, V <: DenseVector}
+    size(forward.cell.Wi, 2) == size(backward.cell.Wi, 2) || throw(DimensionMismatch("input dimension, $(size(forward.cell.Wi, 2)), of the forward-time LSTM layer does not match the input dimension, $(size(backward.cell.Wi, 2)), of the backward-time LSTM layer"))
+
+    out_dim = length(forward.cell.h)
+    out_dim == length(backward.cell.h) || throw(DimensionMismatch("output dimension, $out_dim, of the forward-time LSTM layer does not match the output dimension, $(length(backward.cell.h)), of the backward-time LSTM layer"))
+    return BLSTM(forward, backward, out_dim)
+end
+
+Base.show(io::IO, l::BLSTM) = print(io,  "BLSTM(", size(l.forward.cell.Wi, 2), ", ", l.dim_out, ")")
+
+"""
+    (m::BLSTM)(Xs::DenseArray{<:Real,3}) -> DenseArray{<:Real,3}
+
+Forward pass of the bidirectional LSTM layer for a 3D tensor input.
+Input tensor must be arranged in D×T×B (input dimension × time duration × # batches) order.
+"""
+function (m::BLSTM)(Xs::DenseArray{<:Real,3})
+   # preallocate output buffer
+   Ys = Buffer(Xs, 2m.dim_out, size(Xs,2), size(Xs,3))
+   axisYs₁ = axes(Ys, 1)
+   time    = axes(Ys, 2)
+   rev_time = reverse(time)
+   @inbounds begin
+      # get forward and backward slice indices
+      slice_f = axisYs₁[1:m.dim_out]
+      slice_b = axisYs₁[(m.dim_out+1):end]
+      # bidirectional run step
+      setindex!.(Ref(Ys),  m.forward.(view.(Ref(Xs), :, time, :)), Ref(slice_f), time, :)
+      setindex!.(Ref(Ys), m.backward.(view.(Ref(Xs), :, rev_time, :)), Ref(slice_b), rev_time, :)
+      # the same as
+      # @views for (t_f, t_b) ∈ zip(time, rev_time)
+      #    Ys[slice_f, t_f, :] =  m.forward(Xs[:, t_f, :])
+      #    Ys[slice_b, t_b, :] = m.backward(Xs[:, t_b, :])
+      # end
+      # but implemented via broadcasting as Zygote differentiates loops much slower than broadcasting
+   end
+   return copy(Ys)
+end
+
+# Flux.reset!(m::BLSTM) = reset!((m.forward, m.backward)) # not needed as taken care of by @functor
+
+include("dataprepLJSpeech/dataprepLJSpeech.jl")
+
+struct CharEmbedding{M <: DenseMatrix, D <: AbstractDict}
+   alphabet  :: D
+   embedding :: M
+end
+
+@functor CharEmbedding (embedding,)
+
+function CharEmbedding(alphabet::AbstractVector{Char}, embedding_dim::Integer = 512)
+   sort!(alphabet)
+   alphabet′ = Dict(v => k for (k, v) ∈ enumerate(alphabet))
+   n = length(alphabet′)
+   n == length(alphabet) || throw("alphabet contains duplicate characters")
+   d = Dense(n, embedding_dim)
+   CharEmbedding(alphabet′, gpu(d.W))
+end
+
+getindices(dict::AbstractDict, chars) = getindex.((dict,), chars)
+
+(m::CharEmbedding)(c::Char) = m.embedding[:, m.alphabet[c]]
+(m::CharEmbedding)(chars) = m.embedding[:, getindices(m.alphabet, chars)]
+function (m::CharEmbedding)(textsbatch::AbstractVector)
+   indices = getindices.((m.alphabet,), textsbatch)
+   embeddings = bufferfrom(Array{Float32}(undef, size(m.embedding,1), length(first(textsbatch)), length(textsbatch)))
+   for (k, idcs) ∈ enumerate(indices)
+      embeddings[:,:,k] = m.embedding[:,idcs]
+   end
+   return copy(embeddings)
+end
+
+
+datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
+metadatapath = joinpath(datadir, "metadata.csv")
+melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
+
+batches, alphabet = batch_dataset(metadatapath, melspectrogramspath, 32)
+textsbatch, y = first(batches)
+
+
+m = CharEmbedding(alphabet)
+
+
+
+
+
+function f1(m::CharEmbedding, textsbatch::AbstractVector)
+   indices = getindices.((m.alphabet,), textsbatch)
+   embeddings = bufferfrom(Array{Float32}(undef, size(m.embedding,1), length(first(textsbatch)), length(textsbatch)))
+   for (k, idcs) ∈ enumerate(indices)
+      embeddings[:,:,k] = m.embedding[:,idcs]
+   end
+   return copy(embeddings)
+end
+function f2(m::CharEmbedding, textsbatch::AbstractVector)
+   indices = getindices.((m.alphabet,), textsbatch)
+   embeddings = bufferfrom(Array{Float32}(undef, size(m.embedding,1), length(first(textsbatch)), length(textsbatch)))
+   setindex!.((embeddings,), getindex.((m.embedding,), :, indices), :, :, axes(embeddings,3))
+   return copy(embeddings)
+end
+function g1(θ, m, texts)
+   gradient(θ) do
+      sum(f1(m, texts))
+   end
+end
+function g2(θ, m, texts)
+   gradient(θ) do
+      sum(f2(m, texts))
+   end
+end
+
+θ = Flux.params(m)
+
+g1(θ, m, textsbatch)
+g2(θ, m, textsbatch)
+
+@benchmark f1($m, $textsbatch)
+@benchmark f2($m, $textsbatch)
+@benchmark g1($θ, $m, $textsbatch)
+@benchmark g2($θ, $m, $textsbatch)
+
+
+
+
+
+
+
+
+
+conv = Chain(Conv((5,), 512=>512; pad=(4, 0)), BatchNorm(512, leakyrelu),
+             Conv((5,), 512=>512; pad=(4, 0)), BatchNorm(512, leakyrelu),
+             Conv((5,), 512=>512; pad=(4, 0)), BatchNorm(512, leakyrelu),
+)
+blstm = BLSTM(512, 256)
+
+labels = sort(unique(text))
+
+xs = Flux.onehotbatch((char for char ∈ text), labels)
+
+xs1 = char_embedding(xs)'
+xs1 = reshape(xs1, size(xs1,1), :, 1)
+xs2 = conv(xs1)
+xs2 = permutedims(xs2, (2, 1, 3))
+xs3 = blstm(xs2)
+
+values = xs3
+hs = values
+L = size(hs,2)
+
+# attention weights
+α = attend(s, hs)
+α = reshape(softmax(rand(L)), :, 1, 1)
+# glimpse
+g = dropdims(sum(α .* hs; dims=2); dims=2)
+
+
+
+conv = Conv((31,), 1=>32, pad = (31-1)÷2)
+conv(α)
+
+struct LocationAwareAttention{M <: DenseMatrix, V <: DenseVector, A <: DenseArray, D <: Dense}
+   dense :: D # W & b
+   F :: A
+   U :: M
+   V :: M
+   w :: V
+end
+
+@functor LocationAwareAttention
+
+function LocationAwareAttention(attention_dim::Integer = 128,
+                                encoding_dim::Integer = 512,
+                                decoding_dim::Integer = 1024,
+                                location_feature_dim::Integer = 32)
+   dense = Dense(decoding_dim, attention_dim)
+   c = Conv((31,), 1=>location_feature_dim, pad = (31-1)÷2)
+   denseU = Dense(location_feature_dim, attention_dim)
+   denseV = Dense(encoding_dim, attention_dim)
+   densew = Dense(attention_dim,1)
+   LocationAwareAttention(dense, c.weight, denseU.W, denseV.W, vec(densew.W))
+end
+
+laa = LocationAwareAttention()
+
+function (laa::LocationAwareAttention)(α::DenseArray{<:Real,3}, s::DenseVector, hs)
+   dense, F, U, V, w = laa.dense, laa.F, laa.U, laa.V, laa.w
+   cdims = DenseConvDims(α, F; padding=(15, 15))
+   f = permutedims(conv(α, F, cdims), (2,1,3)) # F✶α
+   energiesᵢ = w'tanh.(dense(s) .+ V * reshape(hs, size(hs, 1), :) + U * reshape(f, size(f, 1), :))
+   αᵢ = softmax(energiesᵢ; dims=2)
+end
