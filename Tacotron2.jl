@@ -25,9 +25,9 @@ end
 function BLSTM(forward::Recur{LSTMCell{M,V}}, backward::Recur{LSTMCell{M,V}}) where {M <: DenseMatrix, V <: DenseVector}
     size(forward.cell.Wi, 2) == size(backward.cell.Wi, 2) || throw(DimensionMismatch("input dimension, $(size(forward.cell.Wi, 2)), of the forward-time LSTM layer does not match the input dimension, $(size(backward.cell.Wi, 2)), of the backward-time LSTM layer"))
 
-    out_dim = length(forward.cell.h)
-    out_dim == length(backward.cell.h) || throw(DimensionMismatch("output dimension, $out_dim, of the forward-time LSTM layer does not match the output dimension, $(length(backward.cell.h)), of the backward-time LSTM layer"))
-    return BLSTM(forward, backward, out_dim)
+    outdim = length(forward.cell.h)
+    outdim == length(backward.cell.h) || throw(DimensionMismatch("output dimension, $outdim, of the forward-time LSTM layer does not match the output dimension, $(length(backward.cell.h)), of the backward-time LSTM layer"))
+    return BLSTM(forward, backward, outdim)
 end
 
 Base.show(io::IO, l::BLSTM) = print(io,  "BLSTM(", size(l.forward.cell.Wi, 2), ", ", l.dim_out, ")")
@@ -81,6 +81,12 @@ function CharEmbedding(alphabet::AbstractVector{Char}, embedding_dim::Integer = 
    CharEmbedding(alphabet′, gpu(permutedims(d.W)))
 end
 
+function Base.show(io::IO, l::CharEmbedding)
+   alphabet = keys(sort(l.alphabet; by = last))
+   dim = size(l.embedding, 2)
+   print(io, "CharEmbedding(", alphabet, ", ", dim, ")")
+end
+
 getindices(dict::AbstractDict, chars) = getindex.((dict,), chars)
 
 (m::CharEmbedding)(c::Char) = m.embedding[:, m.alphabet[c]]
@@ -89,7 +95,23 @@ function (m::CharEmbedding)(textsbatch::AbstractVector)
    indices = getindices.((m.alphabet,), textsbatch)
    embeddings = Buffer(m.embedding, length(first(textsbatch)), size(m.embedding,2), length(textsbatch))
    setindex!.((embeddings,), getindex.((m.embedding,), indices, :), :, :, axes(embeddings,3))
+   # the same as
+   # for (k, idcs) ∈ enumerate(indices)
+   #    embeddings[:,:,k] = m.embedding[idcs,:]
+   # end
+   # but implemented via broadcasting as Zygote differentiates loops much slower than broadcasting
    return copy(embeddings)
+end
+
+function ConvBlock(nlayers::Integer, σ=leakyrelu; filter_size=5, nchannels=512, pdrop=0.5)
+   # "The convolutional layers in the network are regularized using dropout with probability 0.5"
+   padding = (filter_size-1, 0)
+   layers = reduce(vcat, map(1:nlayers) do _
+      [Conv((filter_size,), nchannels=>nchannels; pad=padding),
+       BatchNorm(nchannels, σ),
+       Dropout(pdrop)]
+   end)
+   return Chain(layers...)
 end
 
 
@@ -98,26 +120,23 @@ metadatapath = joinpath(datadir, "metadata.csv")
 melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
 
 batches, alphabet = batch_dataset(metadatapath, melspectrogramspath, 32)
-texts, y = first(batches)
+texts, targets = first(batches)
 m = CharEmbedding(alphabet)
+convblock3 = ConvBlock(3)
 
-m(texts)
+x = m(texts)
+x = convblock3(x)
 
-
-
-
-
-
+permutedims(x, (2, 3, 1))
 
 
 
 
-conv = Chain(Conv((5,), 512=>512; pad=(4, 0)), BatchNorm(512, leakyrelu),
-             Conv((5,), 512=>512; pad=(4, 0)), BatchNorm(512, leakyrelu),
-             Conv((5,), 512=>512; pad=(4, 0)), BatchNorm(512, leakyrelu),
-)
+
+
 blstm = BLSTM(512, 256)
-
+println(conv)
+println(convblock3)
 
 labels = sort(unique(text))
 
