@@ -1,7 +1,7 @@
 using Flux
 using Flux: @functor, Recur, LSTMCell
 using Zygote
-using Zygote: Buffer, bufferfrom
+using Zygote: Buffer
 
 """
     BLSTM(in::Integer, out::Integer)
@@ -78,7 +78,7 @@ function CharEmbedding(alphabet::AbstractVector{Char}, embedding_dim::Integer = 
    n = length(alphabet′)
    n == length(alphabet) || throw("alphabet contains duplicate characters")
    d = Dense(n, embedding_dim)
-   CharEmbedding(alphabet′, gpu(d.W))
+   CharEmbedding(alphabet′, gpu(permutedims(d.W)))
 end
 
 getindices(dict::AbstractDict, chars) = getindex.((dict,), chars)
@@ -87,8 +87,8 @@ getindices(dict::AbstractDict, chars) = getindex.((dict,), chars)
 (m::CharEmbedding)(chars) = m.embedding[:, getindices(m.alphabet, chars)]
 function (m::CharEmbedding)(textsbatch::AbstractVector)
    indices = getindices.((m.alphabet,), textsbatch)
-   embeddings = bufferfrom(Array{Float32}(undef, size(m.embedding,1), length(first(textsbatch)), length(textsbatch)))
-   setindex!.((embeddings,), getindex.((m.embedding,), :, indices), :, :, axes(embeddings,3))
+   embeddings = Buffer(m.embedding, length(first(textsbatch)), size(m.embedding,2), length(textsbatch))
+   setindex!.((embeddings,), getindex.((m.embedding,), indices, :), :, :, axes(embeddings,3))
    return copy(embeddings)
 end
 
@@ -98,11 +98,10 @@ metadatapath = joinpath(datadir, "metadata.csv")
 melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
 
 batches, alphabet = batch_dataset(metadatapath, melspectrogramspath, 32)
-textsbatch, y = first(batches)
-
-
+texts, y = first(batches)
 m = CharEmbedding(alphabet)
 
+m(texts)
 
 
 
@@ -118,6 +117,7 @@ conv = Chain(Conv((5,), 512=>512; pad=(4, 0)), BatchNorm(512, leakyrelu),
              Conv((5,), 512=>512; pad=(4, 0)), BatchNorm(512, leakyrelu),
 )
 blstm = BLSTM(512, 256)
+
 
 labels = sort(unique(text))
 
