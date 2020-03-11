@@ -88,9 +88,10 @@ Base.show(io::IO, l::BLSTM) = print(io,  "BLSTM(", size(l.forward.cell.Wi, 2), "
     (m::BLSTM)(Xs::DenseArray{<:Real,3}) -> DenseArray{<:Real,3}
 
 Forward pass of the bidirectional LSTM layer for a 3D tensor input.
-Input tensor must be arranged in D×B×T (input dimension × # batches × time duration) order.
+Input tensor must be arranged in T×D×B (time duration × input dimension × # batches) order.
 """
 function (m::BLSTM)(Xs::DenseArray{<:Real,3})
+   Xs = permutedims(Xs, (2, 3, 1)) # [t×d×b] -> [d×b×t]
    # preallocate output buffer
    Ys = Buffer(Xs, 2m.outdim, size(Xs,2), size(Xs,3))
    axisYs₁ = axes(Ys, 1)
@@ -110,7 +111,7 @@ function (m::BLSTM)(Xs::DenseArray{<:Real,3})
       # end
       # but implemented via broadcasting as Zygote differentiates loops much slower than broadcasting
    end
-   return copy(Ys)
+   return permutedims(copy(Ys), (1,3,2)) # [d×b×t] -> [d×t×b]
 end
 
 # Flux.reset!(m::BLSTM) = reset!((m.forward, m.backward)) # not needed as taken care of by @functor
@@ -145,22 +146,27 @@ end
 function (laa::LocationAwareAttention)(query::DenseMatrix, values::T, Σweights::T) where T <: DenseArray{<:Real,3}
    dense, F, U, V, w = laa.dense, laa.F, laa.U, laa.V, laa.w
    cdims = DenseConvDims(Σweights, F; padding=laa.pad)
-   hs = permutedims(values, (1,3,2)) # [d×b×t] -> [d×t×b]
    fs = conv(Σweights, F, cdims) # F✶Σα
-   @ein Uf[a,t,b] := U[a,c] * fs[t,c,b] # location keys
+   # location keys
+   @ein Uf[a,t,b] := U[a,c] * fs[t,c,b] # dispatches to batched_contract
    # check: Uf ≈ reduce(hcat, [reshape(U * fs[t,:,:], size(U,1), 1, :) for t ∈ axes(fs,1)])
-   @ein Vh[a,t,b] := V[a,d] * hs[d,t,b] # memory keys
-   # check: Vh ≈ reduce(hcat, [reshape(V * hs[:,t,:], size(V,1), 1, :) for t ∈ axes(hs,2)])
+   # memory keys
+   @ein Vh[a,t,b] := V[a,d] * values[d,t,b] # dispatches to batched_contract
+   # check: Vh ≈ reduce(hcat, [reshape(V * values[:,t,:], size(V,1), 1, :) for t ∈ axes(values,2)])
    Ws⁺b = reshape(dense(query), size(V,1), 1, :) # (a -> b) & (t -> c -> b)
    tanhWs⁺Vh⁺Uf⁺b = tanh.(Ws⁺b .+ Vh + Uf)
-   @ein energies[t,b] := w[a] * tanhWs⁺Vh⁺Uf⁺b[a,t,b]
+   @ein energies[t,b] := w[a] * tanhWs⁺Vh⁺Uf⁺b[a,t,b] # dispatches to batched_contract
    # check: energies == reduce(vcat, [w'tanhWs⁺Vh⁺Uf⁺b[:,t,:] for t ∈ axes(tanhWs⁺Vh⁺Uf⁺b,2)])
    α = softmax(energies)
-   @ein context[d,b] := α[t,b] * hs[d,t,b]
-   # check: context ≈ reduce(hcat, [sum(α[t,b] * hs[:,t,b] for t ∈ axes(hs,2)) for b ∈ axes(hs,3)])
+   @ein context[d,b] := α[t,b] * values[d,t,b] # dispatches to batched_contract
+   # check: context ≈ reduce(hcat, [sum(α[t,b] * values[:,t,b] for t ∈ axes(values,2)) for b ∈ axes(values,3)])
    return context, reshape(α, size(α,1), 1, :)
 end
 
+# "In order to introduce output variation at inference time, dropout with probability 0.5 is applied only to layers in the pre-net of the autoregressive decoder"
+PreNet(in=80, out=256, σ=leakyrelu, pdrop=0.5) =
+   Chain(Dense(in, out, σ), Dropout(pdrop),
+        Dense(out, out, σ), Dropout(pdrop))
 
 datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
 metadatapath = joinpath(datadir, "metadata.csv")
@@ -173,19 +179,40 @@ che = CharEmbedding(alphabet)
 cb3 = ConvBlock(3)
 blstm = BLSTM(512, 256)
 laa = LocationAwareAttention()
+prenet = PreNet()
+
+
+function Base.permutedims(B::StridedArray, perm)
+    @warn "permutedims is called"
+    dimsB = size(B)
+    ndimsB = length(dimsB)
+    (ndimsB == length(perm) && isperm(perm)) || throw(ArgumentError("no valid permutation of dimensions"))
+    dimsP = ntuple(i->dimsB[perm[i]], ndimsB)::typeof(dimsB)
+    P = similar(B, dimsP)
+    permutedims!(P, B, perm)
+end
+
+
 
 x = che(texts)
 x = cb3(x)
-x = permutedims(x, (2, 3, 1))
 x = blstm(x)
-context, weights = laa(query, x, Σweights)
+context, weights = laa(quer, x, Σweights)
+x = prenet(ŷ_prev)
 
+([x; context])
+
+
+
+
+
+ŷ_prev = rand(Float32, 80, batch_size)
+targets
 
 Σweights += weights
-
-query = rand(Float32, decoding_dim, batch_size)
-Σweights = rand(Float32, size(x, 3), 1, batch_size)
-
+decoding_dim=1024
+quer = rand(Float32, decoding_dim, batch_size)
+Σweights = rand(Float32, size(x, 2), 1, batch_size)
 
 
 struct Tacotron2
