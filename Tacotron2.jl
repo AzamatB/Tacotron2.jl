@@ -93,25 +93,25 @@ Input tensor must be arranged in T×D×B (time duration × input dimension × # 
 function (m::BLSTM)(Xs::DenseArray{<:Real,3})
    Xs = permutedims(Xs, (2, 3, 1)) # [t×d×b] -> [d×b×t]
    # preallocate output buffer
-   Ys = Buffer(Xs, 2m.outdim, size(Xs,2), size(Xs,3))
+   Ys = Buffer(Xs, 2m.outdim, size(Xs,3), size(Xs,2))
    axisYs₁ = axes(Ys, 1)
-   time_f = axes(Ys, 3)
+   time_f = axes(Ys, 2)
    time_b = reverse(time_f)
    @inbounds begin
       # get forward and backward slice indices
       slice_f = axisYs₁[1:m.outdim]
       slice_b = axisYs₁[(m.outdim+1):end]
       # bidirectional run step
-      setindex!.((Ys,),  m.forward.(view.((Xs,), :, :, time_f)), (slice_f,), :, time_f)
-      setindex!.((Ys,), m.backward.(view.((Xs,), :, :, time_b)), (slice_b,), :, time_b)
+      setindex!.((Ys,),  m.forward.(view.((Xs,), :, :, time_f)), (slice_f,), time_f, :)
+      setindex!.((Ys,), m.backward.(view.((Xs,), :, :, time_b)), (slice_b,), time_b, :)
       # the same as
       # @views for (t_f, t_b) ∈ zip(time_f, time_b)
-      #    Ys[slice_f, :, t_f] =  m.forward(Xs[:, :, t_f])
-      #    Ys[slice_b, :, t_b] = m.backward(Xs[:, :, t_b])
+      #    Ys[slice_f, t_f, :] =  m.forward(Xs[:, :, t_f])
+      #    Ys[slice_b, t_b, :] = m.backward(Xs[:, :, t_b])
       # end
       # but implemented via broadcasting as Zygote differentiates loops much slower than broadcasting
    end
-   return permutedims(copy(Ys), (1,3,2)) # [d×b×t] -> [d×t×b]
+   return copy(Ys) # [d×t×b]
 end
 
 # Flux.reset!(m::BLSTM) = reset!((m.forward, m.backward)) # not needed as taken care of by @functor
@@ -174,23 +174,12 @@ melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
 
 batch_size = 77
 batches, alphabet = batch_dataset(metadatapath, melspectrogramspath, batch_size)
-texts, targets = first(batches)
+texts, targets = rand(batches)
 che = CharEmbedding(alphabet)
 cb3 = ConvBlock(3)
 blstm = BLSTM(512, 256)
 laa = LocationAwareAttention()
 prenet = PreNet()
-
-
-function Base.permutedims(B::StridedArray, perm)
-    @warn "permutedims is called"
-    dimsB = size(B)
-    ndimsB = length(dimsB)
-    (ndimsB == length(perm) && isperm(perm)) || throw(ArgumentError("no valid permutation of dimensions"))
-    dimsP = ntuple(i->dimsB[perm[i]], ndimsB)::typeof(dimsB)
-    P = similar(B, dimsP)
-    permutedims!(P, B, perm)
-end
 
 
 
@@ -200,9 +189,6 @@ x = blstm(x)
 context, weights = laa(quer, x, Σweights)
 
 x = prenet(ŷ_prev)
-
-([x; context])
-
 
 
 
