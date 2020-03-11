@@ -158,7 +158,7 @@ function (laa::LocationAwareAttention)(query::DenseMatrix, values::T, Σweights:
    @ein energies[t,b] := w[a] * tanhWs⁺Vh⁺Uf⁺b[a,t,b] # dispatches to batched_contract
    # check: energies == reduce(vcat, [w'tanhWs⁺Vh⁺Uf⁺b[:,t,:] for t ∈ axes(tanhWs⁺Vh⁺Uf⁺b,2)])
    α = softmax(energies)
-   @ein context[d,b] := α[t,b] * values[d,t,b] # dispatches to batched_contract
+   @ein context[d,b] := values[d,t,b] * α[t,b] # dispatches to batched_contract
    # check: context ≈ reduce(hcat, [sum(α[t,b] * values[:,t,b] for t ∈ axes(values,2)) for b ∈ axes(values,3)])
    return context, reshape(α, size(α,1), 1, :)
 end
@@ -198,6 +198,7 @@ x = che(texts)
 x = cb3(x)
 x = blstm(x)
 context, weights = laa(quer, x, Σweights)
+
 x = prenet(ŷ_prev)
 
 ([x; context])
