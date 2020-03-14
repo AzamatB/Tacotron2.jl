@@ -7,7 +7,7 @@ using OMEinsum
 include("dataprepLJSpeech/dataprep.jl")
 
 struct CharEmbedding{M <: DenseMatrix}
-   embedding::M
+   embedding :: M
 end
 
 @functor CharEmbedding
@@ -124,7 +124,7 @@ function Base.show(io::IO, l::LocationAwareAttention)
    print(io, "LocationAwareAttention($attention_dim, $encoding_dim, $decoding_dim, $location_feature_dim)")
 end
 
-function (laa::LocationAwareAttention)(query::DenseMatrix, values::T, Σweights::T) where T <: DenseArray{<:Real,3}
+function (laa::LocationAwareAttention)(values::T, query::DenseMatrix, Σweights::T) where T <: DenseArray{<:Real,3}
    dense, F, U, V, w = laa.dense, laa.F, laa.U, laa.V, laa.w
    cdims = DenseConvDims(Σweights, F; padding=laa.pad)
    fs = conv(Σweights, F, cdims) # F✶Σα
@@ -144,10 +144,30 @@ function (laa::LocationAwareAttention)(query::DenseMatrix, values::T, Σweights:
    return context, reshape(α, size(α,1), 1, :)
 end
 
+
+struct PreNet{D}
+   dense₁ :: D
+   dense₂ :: D
+   pdrop  :: Float32
+end
+
+@functor PreNet (dense₁, dense₂)
+
+function PreNet(in::Integer=80, out::Integer=256, σ=leakyrelu, pdrop=0.5)
+   @assert 0 < pdrop < 1
+   PreNet(Dense(in, out, σ) |> gpu, Dense(out, out, σ) |> gpu, Float32(pdrop))
+end
+
+function Base.show(io::IO, l::PreNet)
+   out, in = size(m.dense₁.W)
+   σ = m.dense₁.σ
+   pdrop = m.pdrop
+   print(io, "PreNet($in, $out, $σ, $pdrop)")
+end
+
 # "In order to introduce output variation at inference time, dropout with probability 0.5 is applied only to layers in the pre-net of the autoregressive decoder"
-PreNet(in=80, out=256, σ=leakyrelu, pdrop=0.5) =
-   Chain(Dense(in, out, σ), Dropout(pdrop),
-        Dense(out, out, σ), Dropout(pdrop)) |> gpu
+(m::PreNet)(x::DenseVecOrMat) = dropout(m.dense₂(dropout(m.dense₁(x), pdrop)), pdrop)
+
 
 datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
 metadatapath = joinpath(datadir, "metadata.csv")
@@ -155,7 +175,7 @@ melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
 
 batch_size = 77
 batches, alphabet = build_batches(metadatapath, melspectrogramspath, batch_size)
-input, targets = rand(batches)
+textindices, targets = rand(batches)
 che = CharEmbedding(alphabet)
 cb3 = ConvBlock(3)
 blstm = BLSTM(512, 256)
@@ -163,11 +183,10 @@ laa = LocationAwareAttention()
 prenet = PreNet()
 
 
-
-x = che(texts)
+x = che(textindices)
 x = cb3(x)
 x = blstm(x)
-context, weights = laa(quer, x, Σweights)
+context, weights = laa(x, query, Σweights)
 
 x = prenet(ŷ_prev)
 
@@ -179,7 +198,7 @@ targets
 
 Σweights += weights
 decoding_dim=1024
-quer = rand(Float32, decoding_dim, batch_size)
+query = rand(Float32, decoding_dim, batch_size)
 Σweights = rand(Float32, size(x, 2), 1, batch_size)
 
 
