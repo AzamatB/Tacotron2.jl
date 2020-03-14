@@ -6,42 +6,31 @@ using OMEinsum
 
 include("dataprepLJSpeech/dataprep.jl")
 
-struct CharEmbedding{M <: DenseMatrix, D <: AbstractDict}
-   alphabet  :: D
-   embedding :: M
+struct CharEmbedding{M <: DenseMatrix}
+   embedding::M
 end
 
-@functor CharEmbedding (embedding,)
+@functor CharEmbedding
 
-function CharEmbedding(alphabet::AbstractVector{Char}, embedding_dim=512)
-   sort!(alphabet)
-   alphabet′ = Dict(v => k for (k, v) ∈ enumerate(alphabet))
-   n = length(alphabet′)
-   n == length(alphabet) || throw("alphabet contains duplicate characters")
-   d = Dense(n, embedding_dim)
-   CharEmbedding(alphabet′, gpu(permutedims(d.W)))
+CharEmbedding(alphabet_size::Integer, embedding_dim=512) = CharEmbedding(gpu(Dense(alphabet_size, embedding_dim).W))
+function CharEmbedding(alphabet, embedding_dim=512)
+   alphabet_size = length(alphabet)
+   CharEmbedding(alphabet_size, embedding_dim)
 end
 
 function Base.show(io::IO, l::CharEmbedding)
-   alphabet = keys(sort(l.alphabet; by = last))
-   dim = size(l.embedding, 2)
-   print(io, "CharEmbedding(", alphabet, ", ", dim, ")")
+   embedding_dim, alphabet_size = size(l.embedding)
+   print(io, "CharEmbedding($alphabet_size, $embedding_dim)")
 end
 
-getindices(dict::AbstractDict, chars) = getindex.((dict,), chars)
-
-(m::CharEmbedding)(c::Char) = m.embedding[:, m.alphabet[c]]
-(m::CharEmbedding)(chars) = m.embedding[:, getindices(m.alphabet, chars)]
-function (m::CharEmbedding)(textsbatch::AbstractVector{<:DenseVector})
-   indices = getindices.((m.alphabet,), textsbatch)
-   embeddings = Buffer(m.embedding, length(first(textsbatch)), size(m.embedding,2), length(textsbatch))
-   setindex!.((embeddings,), getindex.((m.embedding,), indices, :), :, :, axes(embeddings,3))
-   # the same as
-   # for (k, idcs) ∈ enumerate(indices)
-   #    embeddings[:,:,k] = m.embedding[idcs,:]
-   # end
-   # but implemented via broadcasting as Zygote differentiates loops much slower than broadcasting
-   return copy(embeddings)
+(m::CharEmbedding)(charidxs::Integer) = m.embedding[:,charidxs]
+function (m::CharEmbedding)(indices::DenseMatrix{<:Integer})
+   time, batch_size = size(indices)
+   ouput = permutedims(reshape(m.embedding[:,reshape(indices,:)], :,time,batch_size), (2,1,3))
+   # #=check=# ouput == permutedims(cat(map(eachcol(indices)) do indicesᵢ
+   #    m.embedding[:,indicesᵢ]
+   # end...; dims=3), (2,1,3))
+   return ouput
 end
 
 function ConvBlock(nlayers::Integer, σ=leakyrelu; filter_size=5, nchannels=512, pdrop=0.5)
@@ -52,7 +41,7 @@ function ConvBlock(nlayers::Integer, σ=leakyrelu; filter_size=5, nchannels=512,
        BatchNorm(nchannels, σ),
        Dropout(pdrop)]
    end)
-   return Chain(layers...)
+   return Chain(layers...) |> gpu
 end
 
 """
@@ -63,7 +52,7 @@ Constructs a bidirectional LSTM layer.
 struct BLSTM{M <: DenseMatrix, V <: DenseVector}
    forward  :: Recur{LSTMCell{M,V}}
    backward :: Recur{LSTMCell{M,V}}
-   outdim  :: Int
+   outdim   :: Int
 end
 
 @functor BLSTM (forward, backward)
@@ -71,15 +60,7 @@ end
 function BLSTM(in::Integer, out::Integer)
    forward  = LSTM(in, out)
    backward = LSTM(in, out)
-   return BLSTM(forward, backward, out)
-end
-
-function BLSTM(forward::Recur{LSTMCell{M,V}}, backward::Recur{LSTMCell{M,V}}) where {M <: DenseMatrix, V <: DenseVector}
-    size(forward.cell.Wi, 2) == size(backward.cell.Wi, 2) || throw(DimensionMismatch("input dimension, $(size(forward.cell.Wi, 2)), of the forward-time LSTM layer does not match the input dimension, $(size(backward.cell.Wi, 2)), of the backward-time LSTM layer"))
-
-    outdim = length(forward.cell.h)
-    outdim == length(backward.cell.h) || throw(DimensionMismatch("output dimension, $outdim, of the forward-time LSTM layer does not match the output dimension, $(length(backward.cell.h)), of the backward-time LSTM layer"))
-    return BLSTM(forward, backward, outdim)
+   return BLSTM(gpu(forward), gpu(backward), out)
 end
 
 Base.show(io::IO, l::BLSTM) = print(io,  "BLSTM(", size(l.forward.cell.Wi, 2), ", ", l.outdim, ")")
@@ -125,7 +106,7 @@ struct LocationAwareAttention{A <: DenseArray, M <: DenseMatrix, V <: DenseVecto
    w :: V
 end
 
-@functor LocationAwareAttention
+@functor LocationAwareAttention (dense, F, U, V, w)
 
 function LocationAwareAttention(attention_dim=128, encoding_dim=512, decoding_dim=1024, location_feature_dim=32)
    dense = Dense(decoding_dim, attention_dim)
@@ -133,7 +114,7 @@ function LocationAwareAttention(attention_dim=128, encoding_dim=512, decoding_di
    denseU = Dense(location_feature_dim, attention_dim)
    denseV = Dense(encoding_dim, attention_dim)
    densew = Dense(attention_dim, 1)
-   LocationAwareAttention(dense, convF.pad, convF.weight, denseU.W, denseV.W, vec(densew.W))
+   LocationAwareAttention(gpu(dense), convF.pad, gpu(convF.weight), gpu(denseU.W), gpu(denseV.W), gpu(vec(densew.W)))
 end
 
 function Base.show(io::IO, l::LocationAwareAttention)
@@ -166,15 +147,15 @@ end
 # "In order to introduce output variation at inference time, dropout with probability 0.5 is applied only to layers in the pre-net of the autoregressive decoder"
 PreNet(in=80, out=256, σ=leakyrelu, pdrop=0.5) =
    Chain(Dense(in, out, σ), Dropout(pdrop),
-        Dense(out, out, σ), Dropout(pdrop))
+        Dense(out, out, σ), Dropout(pdrop)) |> gpu
 
 datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
 metadatapath = joinpath(datadir, "metadata.csv")
 melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
 
 batch_size = 77
-batches, alphabet = batch_dataset(metadatapath, melspectrogramspath, batch_size)
-texts, targets = rand(batches)
+batches, alphabet = build_batches(metadatapath, melspectrogramspath, batch_size)
+input, targets = rand(batches)
 che = CharEmbedding(alphabet)
 cb3 = ConvBlock(3)
 blstm = BLSTM(512, 256)

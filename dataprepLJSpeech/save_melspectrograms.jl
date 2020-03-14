@@ -13,7 +13,7 @@ for (root, _, files) ∈ walkdir(npy_mels_pectrograms_dir)
       key = first(splitext(file))
       npyfilepath = joinpath(root, file)
       value = load(npyfilepath)
-      melspectrograms[key] = value
+      melspectrograms[key] = permutedims(value)
    end
 end
 

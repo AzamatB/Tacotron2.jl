@@ -4,62 +4,69 @@ using FileIO
 using Base.Iterators
 using Random
 
-function batch_dataset(metadatapath::AbstractString, melspectrogramspath::AbstractString, batch_size::Integer; eos='~', pad='_', kwargs...)
+function build_batches(metadatapath::AbstractString, melspectrogramspath::AbstractString, batch_size::Integer; eos='~', pad='_', kwargs...)
    dataset, alphabet = build_dataset(metadatapath, melspectrogramspath; eos=eos, pad=pad)
-   batches = batch_dataset!(dataset, batch_size; eos=eos, pad=pad, kwargs...)
+   batches = build_batches!(dataset, alphabet, batch_size, alphabet[eos], alphabet[pad], kwargs...)
    return batches, alphabet
 end
 
-batch_dataset(dataset::Vector{<:Tuple{String,DenseMatrix{Float32}}}; kwargs...) = batch_dataset!(copy(dataset); kwargs...)
+build_batches(dataset::AbstractVector{<:Tuple{AbstractString,DenseMatrix{Float32}}}, alphabet::AbstractDict{Char,<:Integer}, batch_size::Integer, eosindex::Integer, padindex::Integer; kwargs...) =
+   build_batches!(copy(dataset), alphabet, batch_size, eosindex, padindex; kwargs...)
 
-function batch_dataset!(dataset::Vector{<:Tuple{String,DenseMatrix{Float32}}}, batch_size::Integer; eos='~', pad='_', sorted=false, reorder=true)
+function build_batches!(dataset::AbstractVector{<:Tuple{AbstractString,DenseMatrix{Float32}}},
+                        alphabet::AbstractDict{Char,<:Integer},
+                        batch_size::Integer,
+                        eosindex::Integer,
+                        padindex::Integer;
+                        sorted=false, reorder=true)
    sorted || sort!(dataset; by=length∘first)
    batches = map(partition(dataset, batch_size)) do batch
-      pad_batch(batch, eos, pad; sorted=true, reorder=reorder)
+      pad_batch(batch, alphabet, eosindex, padindex; sorted=true, reorder=reorder)
    end
    reorder && shuffle!(batches)
    return batches
 end
 
-function pad_batch(batch::AbstractVector{<:Tuple{String,DenseMatrix{Float32}}}, eos::Char, pad::Char; sorted=false, reorder=true)
+function pad_batch(batch::AbstractVector{<:Tuple{String,DenseMatrix{Float32}}}, alphabet::AbstractDict{Char,<:Integer}, eosindex::Integer, padindex::Integer; sorted=false, reorder=true)
    batch_size = length(batch)
-   len_x = sorted ? (length∘first∘last)(batch) : maximum(length∘first, batch)
-   len_y = maximum(xy -> size(last(xy), 2), batch)
-   nchannels_y = size(last(first(batch)), 1)
+   maxlength_x = 1 + (sorted ? (length∘first∘last)(batch) : maximum(length∘first, batch))
+   maxlength_y = maximum(xy -> size(last(xy), 1), batch)
+   nchannels_y = size(last(first(batch)), 2)
 
    reorder && (batch = shuffle(batch))
+   textindices = fill(padindex, maxlength_x, batch_size)
+   melspectrograms = zeros(Float32, maxlength_y, nchannels_y, batch_size)
 
-   texts = map(batch) do (text, _)
-      collect(text * eos * pad^(len_x - length(text)))
+   for (batchidx, (text, melspectrogram)) ∈ enumerate(batch)
+      melspectrograms[axes(melspectrogram,1),:,batchidx] = melspectrogram
+      for (i, char) ∈ enumerate(text)
+         textindices[i,batchidx] = alphabet[char]
+      end
+      textindices[length(text)+1,batchidx] = eosindex
    end
-
-   melspectrograms = zeros(Float32, len_y, nchannels_y, batch_size)
-   for (k, (_, melspectrogram)) ∈ enumerate(batch)
-      len = size(melspectrogram, 2)
-      melspectrograms[1:len,:,k] = melspectrogram'
-   end
-   return texts, melspectrograms
+   return textindices, melspectrograms
 end
 
 function build_dataset(metadatapath::AbstractString, melspectrogramspath::AbstractString; eos='~', pad='_')
    df = DataFrame(CSV.File(metadatapath; delim='|', header=[:file_name, :text, :text_normalized], quotechar='\\', escapechar='\\'))
    ## sanity check that dataframe was parsed correctly
-   # lines = open(metadatapath) do file
-   #     readlines(file)
-   # end
+   # lines = readlines(metadatapath)
    # all(i -> collect(df[i,:]) == split(lines[i], '|'), eachindex(lines))
    select!(df, Not(:text))
-   alphabet = build_alphabet(df.text_normalized; eos='~', pad='_')
    melspectrograms = load(melspectrogramspath, "melspectrograms")
-
    dataset = map(eachrow(df)) do row
       row.text_normalized, melspectrograms[row.file_name]
    end
+   alphabet = build_alphabet(df.text_normalized; eos='~', pad='_')
    return dataset, alphabet
 end
 
 function build_alphabet(texts::AbstractVector{<:AbstractString}; eos::Char, pad::Char)
    alphabet = sort(unique(reduce(*, texts)))
-   push!(alphabet, eos, pad)
-   return alphabet
+   # padding character will be used a lot, so make its index to be 2 and make eos char index to be 1
+   errormessage(char) = char -> "Cannot add the $char character to the alphabet because it already contains it"
+   (eos ∈ alphabet) && error(errormessage("eos"))
+   (pad ∈ alphabet) && error(errormessage("pad"))
+   pushfirst!(alphabet, eos, pad)
+   return Dict(v => k for (k, v) ∈ enumerate(alphabet))
 end
