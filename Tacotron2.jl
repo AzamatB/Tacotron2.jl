@@ -1,8 +1,9 @@
 using Flux
-using Flux: @functor, Recur, LSTMCell
+using Flux: @functor, Recur, LSTMCell, dropout
 using Zygote
-using Zygote: Buffer
+using Zygote: Buffer, @adjoint
 using OMEinsum
+using NamedTupleTools
 
 include("dataprepLJSpeech/dataprep.jl")
 
@@ -26,22 +27,22 @@ end
 (m::CharEmbedding)(charidxs::Integer) = m.embedding[:,charidxs]
 function (m::CharEmbedding)(indices::DenseMatrix{<:Integer})
    time, batch_size = size(indices)
-   ouput = permutedims(reshape(m.embedding[:,reshape(indices,:)], :,time,batch_size), (2,1,3))
-   # #=check=# ouput == permutedims(cat(map(eachcol(indices)) do indicesᵢ
+   output = permutedims(reshape(m.embedding[:,reshape(indices,:)], :,time,batch_size), (2,1,3))
+   # #=check=# output == permutedims(cat(map(eachcol(indices)) do indicesᵢ
    #    m.embedding[:,indicesᵢ]
    # end...; dims=3), (2,1,3))
-   return ouput
+   return output # [t×c×b]
 end
 
-function ConvBlock(nlayers::Integer, σ=leakyrelu; filter_size=5, nchannels=512, pdrop=0.5)
+function convblock(nchannels::Pair{<:Integer,<:Integer} = (512=>512),
+                   σ = identity,
+                   filtersize::Integer = 5,
+                   pdrop = 0.5f0;
+                   pad = (filtersize-1,0), kwargs...)
    # "The convolutional layers in the network are regularized using dropout with probability 0.5"
-   padding = (filter_size-1, 0)
-   layers = reduce(vcat, map(1:nlayers) do _
-      [Conv((filter_size,), nchannels=>nchannels; pad=padding),
-       BatchNorm(nchannels, σ),
-       Dropout(pdrop)]
-   end)
-   return Chain(layers...) |> gpu
+   [Conv((filtersize,), nchannels; pad=pad, kwargs...),
+    BatchNorm(last(nchannels), σ),
+    Dropout(pdrop)] |> gpu
 end
 
 """
@@ -63,7 +64,11 @@ function BLSTM(in::Integer, out::Integer)
    return BLSTM(gpu(forward), gpu(backward), out)
 end
 
-Base.show(io::IO, l::BLSTM) = print(io,  "BLSTM(", size(l.forward.cell.Wi, 2), ", ", l.outdim, ")")
+function Base.show(io::IO, l::BLSTM)
+   in = size(l.forward.cell.Wi, 2)
+   out = l.outdim
+   print(io, "BLSTM($in, $out)")
+end
 
 """
     (m::BLSTM)(Xs::DenseArray{<:Real,3}) -> DenseArray{<:Real,3}
@@ -108,7 +113,7 @@ end
 
 @functor LocationAwareAttention (dense, F, U, V, w)
 
-function LocationAwareAttention(attention_dim=128, encoding_dim=512, decoding_dim=1024, location_feature_dim=32)
+function LocationAwareAttention(encoding_dim=512, location_feature_dim=32, attention_dim=128, decoding_dim=1024)
    dense = Dense(decoding_dim, attention_dim)
    convF = Conv((31,), 1=>location_feature_dim, pad = (31-1)÷2)
    denseU = Dense(location_feature_dim, attention_dim)
@@ -118,22 +123,22 @@ function LocationAwareAttention(attention_dim=128, encoding_dim=512, decoding_di
 end
 
 function Base.show(io::IO, l::LocationAwareAttention)
-   attention_dim, decoding_dim = size(l.dense.W)
    encoding_dim = size(l.V, 2)
    location_feature_dim = size(l.F, 3)
-   print(io, "LocationAwareAttention($attention_dim, $encoding_dim, $decoding_dim, $location_feature_dim)")
+   attention_dim, decoding_dim = size(l.dense.W)
+   print(io, "LocationAwareAttention($encoding_dim, $location_feature_dim, $attention_dim, $decoding_dim)")
 end
 
 function (laa::LocationAwareAttention)(values::T, query::DenseMatrix, Σweights::T) where T <: DenseArray{<:Real,3}
    dense, F, U, V, w = laa.dense, laa.F, laa.U, laa.V, laa.w
+   # memory keys
+   @ein Vh[a,t,b] := V[a,d] * values[d,t,b] # dispatches to batched_contract
+   # check: Vh ≈ reduce(hcat, [reshape(V * values[:,t,:], size(V,1), 1, :) for t ∈ axes(values,2)])
    cdims = DenseConvDims(Σweights, F; padding=laa.pad)
    fs = conv(Σweights, F, cdims) # F✶Σα
    # location keys
    @ein Uf[a,t,b] := U[a,c] * fs[t,c,b] # dispatches to batched_contract
    # check: Uf ≈ reduce(hcat, [reshape(U * fs[t,:,:], size(U,1), 1, :) for t ∈ axes(fs,1)])
-   # memory keys
-   @ein Vh[a,t,b] := V[a,d] * values[d,t,b] # dispatches to batched_contract
-   # check: Vh ≈ reduce(hcat, [reshape(V * values[:,t,:], size(V,1), 1, :) for t ∈ axes(values,2)])
    Ws⁺b = reshape(dense(query), size(V,1), 1, :) # (a -> b) & (t -> c -> b)
    tanhWs⁺Vh⁺Uf⁺b = tanh.(Ws⁺b .+ Vh + Uf)
    @ein energies[t,b] := w[a] * tanhWs⁺Vh⁺Uf⁺b[a,t,b] # dispatches to batched_contract
@@ -144,8 +149,7 @@ function (laa::LocationAwareAttention)(values::T, query::DenseMatrix, Σweights:
    return context, reshape(α, size(α,1), 1, :)
 end
 
-
-struct PreNet{D}
+struct PreNet{D<:Dense}
    dense₁ :: D
    dense₂ :: D
    pdrop  :: Float32
@@ -153,20 +157,110 @@ end
 
 @functor PreNet (dense₁, dense₂)
 
-function PreNet(in::Integer=80, out::Integer=256, σ=leakyrelu, pdrop=0.5)
+function PreNet(in::Integer, out::Integer=256, pdrop=0.5f0, σ=leakyrelu)
    @assert 0 < pdrop < 1
    PreNet(Dense(in, out, σ) |> gpu, Dense(out, out, σ) |> gpu, Float32(pdrop))
 end
 
 function Base.show(io::IO, l::PreNet)
-   out, in = size(m.dense₁.W)
-   σ = m.dense₁.σ
-   pdrop = m.pdrop
-   print(io, "PreNet($in, $out, $σ, $pdrop)")
+   out, in = size(l.dense₁.W)
+   pdrop = l.pdrop
+   σ = l.dense₁.σ
+   print(io, "PreNet($in, $out, $pdrop, $σ)")
 end
 
 # "In order to introduce output variation at inference time, dropout with probability 0.5 is applied only to layers in the pre-net of the autoregressive decoder"
-(m::PreNet)(x::DenseVecOrMat) = dropout(m.dense₂(dropout(m.dense₁(x), pdrop)), pdrop)
+(m::PreNet)(x::DenseVecOrMat) = dropout(m.dense₂(dropout(m.dense₁(x), m.pdrop)), m.pdrop)
+
+struct Tacotron2{E <: Chain, A <: LocationAwareAttention, P <: PreNet, L <: Chain, D₁ <: Dense, D₂ <: Dense, C <: Chain}
+   encoder   :: E
+   attention :: A
+   prenet    :: P
+   lstms     :: L
+   frameproj :: D₁
+   stopproj  :: D₂
+   postnet   :: C
+end
+
+@functor Tacotron2
+
+function Tacotron2(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_feature,:prenet,:decoding,:melfeatures,:postnet), <:NTuple{8,Integer}},
+   filtersizes::NamedTuple{(:encoding,:postnet),<:NTuple{2,Integer}},
+   pdrops::NamedTuple{(:encoding,:prenet,:postnet),<:NTuple{3,AbstractFloat}})
+   @assert iseven(dims.encoding)
+
+   che = CharEmbedding(dims.alphabet, dims.encoding)
+   convblock₃ = Chain(reduce(vcat, map(_ -> convblock(dims.encoding=>dims.encoding, leakyrelu, filtersizes.encoding, pdrops.encoding), 1:3))...) |> gpu
+   blstm = BLSTM(dims.encoding, dims.encoding÷2)
+   encoder = Chain(che, convblock₃.layers..., blstm)
+
+   attention = LocationAwareAttention(dims.encoding, dims.location_feature, dims.attention, dims.decoding)
+   prenet = PreNet(dims.melfeatures, dims.prenet, pdrops.prenet)
+   lstms = Chain(LSTM(dims.prenet + dims.encoding, dims.decoding), LSTM(dims.decoding, dims.decoding))
+
+   frameproj = Dense(dims.decoding + dims.encoding, dims.melfeatures)
+   stopproj = Dense(dims.decoding + dims.encoding, 1, σ)
+
+   nchmel, nch, fs, pdrop = dims.melfeatures, dims.postnet, filtersizes.postnet, pdrops.postnet
+   postnet = Chain([convblock(nchmel=>nch, tanh, fs, pdrop);
+                    convblock(nch=>nch, tanh, fs, pdrop);
+                    convblock(nch=>nch, tanh, fs, pdrop);
+                    convblock(nch=>nch, tanh, fs, pdrop);
+                    convblock(nch=>nchmel, identity, fs, pdrop)]...)
+   Tacotron2(encoder, attention, prenet, lstms, frameproj, stopproj, postnet)
+end
+
+function Tacotron2(alphabet,
+   otherdims=(encoding=512, attention=128, location_feature=32, prenet=256, decoding=1024, melfeatures=80, postnet=512), filtersize::Integer=5, pdrop=0.5f0)
+   dims = merge((alphabet = length(alphabet),), otherdims)
+   filtersizes = (encoding=filtersize, postnet=filtersize)
+   pdrops = (encoding=pdrop, prenet=pdrop, postnet=pdrop)
+   Tacotron2(dims, filtersizes, pdrops)
+end
+
+
+
+m = Tacotron2(alphabet)
+
+
+
+lstms([prenet(lastframe); context])
+values = encoder(textindices)
+context, weights = attention(values, query, Σweights)
+
+y: [c×b×t]
+prenet: [c×bt]
+lstms: [c×b×t]
+proj: [c×bt]
+
+
+1
+postnet: [t,c,b]
+1
+y: [c×b×t]
+
+y: [t,c,b]
+1
+prenet: [c×bt]
+lstms: [c×b×t]
+proj: [c×bt]
+1
+
+postnet: [t,c,b]
+y: [t,c,b]
+
+c×b
+context
+
+
+nmels✶batch_size = nmelfeatures*batch_size
+
+
+ŷ_last = permutedims(ŷ_last, (2,3,1))
+
+resize!(reshape(ŷ_last, :), nmels✶batch_size)
+
+
 
 
 datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
@@ -176,36 +270,26 @@ melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
 batch_size = 77
 batches, alphabet = build_batches(metadatapath, melspectrogramspath, batch_size)
 textindices, targets = rand(batches)
-che = CharEmbedding(alphabet)
-cb3 = ConvBlock(3)
-blstm = BLSTM(512, 256)
-laa = LocationAwareAttention()
-prenet = PreNet()
 
 
 x = che(textindices)
 x = cb3(x)
 x = blstm(x)
+decoding_dim = 1024
+attention_dim = 512
+out_dim = 80
+query = rand(Float32, decoding_dim, batch_size)
+Σweights = rand(Float32, size(values, 2), 1, batch_size)
 context, weights = laa(x, query, Σweights)
+lastframe = rand(Float32, nmelfeatures, batch_size)
+x_prenet = prenet(ŷ_last)
 
-x = prenet(ŷ_prev)
-
-
-
-
-ŷ_prev = rand(Float32, 80, batch_size)
-targets
 
 Σweights += weights
-decoding_dim=1024
-query = rand(Float32, decoding_dim, batch_size)
-Σweights = rand(Float32, size(x, 2), 1, batch_size)
+targets
 
+x = lstms([x_prenet; context])
 
-struct Tacotron2
-   embedchar::CharEmbedding
-   convblock3
-   blstm::BLSTM
-   attend::LocationAwareAttention
-   convblock5
-end
+x_cat_context = [x; context]
+frame = pred_projection(x_cat_context)
+pstop = stop_projection(x_cat_context)
