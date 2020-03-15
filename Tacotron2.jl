@@ -114,9 +114,10 @@ end
 
 @functor LocationAwareAttention (dense, F, U, V, w)
 
-function LocationAwareAttention(encoding_dim=512, location_feature_dim=32, attention_dim=128, decoding_dim=1024)
+function LocationAwareAttention(encoding_dim=512, location_feature_dim=32, attention_dim=128, decoding_dim=1024, filtersize=31)
+   @assert isodd(filtersize)
    dense = Dense(decoding_dim, attention_dim)
-   convF = Conv((31,), 1=>location_feature_dim, pad = (31-1)÷2)
+   convF = Conv((filtersize,), 2=>location_feature_dim, pad = (filtersize-1)÷2)
    denseU = Dense(location_feature_dim, attention_dim)
    denseV = Dense(encoding_dim, attention_dim)
    densew = Dense(attention_dim, 1)
@@ -130,22 +131,24 @@ function Base.show(io::IO, m::LocationAwareAttention)
    print(io, "LocationAwareAttention($encoding_dim, $location_feature_dim, $attention_dim, $decoding_dim)")
 end
 
-function (m::LocationAwareAttention)(values::T, keys::T, query::DenseMatrix, Σweights::T) where T <: DenseArray{<:Real,3}
-   time, _, batch_size = size(Σweights)
+function (m::LocationAwareAttention)(values::T, keys::T, query::M, Σweights::M, weightsᵢ₋₁::M) where {T <: DenseArray{<:Real,3}, M <: DenseMatrix}
+   time, batch_size = size(Σweights)
    attention_dim = length(m.w)
-   cdims = DenseConvDims(Σweights, m.F; padding=m.pad)
+   rdims = (time, 1, batch_size)
+   weights_cat = [reshape(Σweights, rdims) reshape(weightsᵢ₋₁, rdims)]
+   cdims = DenseConvDims(weights_cat, m.F; padding=m.pad)
    # location features
-   fs = conv(Σweights, m.F, cdims) # F✶Σα
+   fs = conv(weights_cat, m.F, cdims) # F✶weights_cat
    @ein Uf[a,t,b] := m.U[a,c] * fs[t,c,b] # dispatches to batched_contract
    # check: Uf ≈ reduce(hcat, [reshape(m.U * fs[t,:,:], size(m.U,1), 1, :) for t ∈ axes(fs,1)])
    Ws⁺b = reshape(m.dense(query), attention_dim, 1, batch_size) # (a -> b) & (t -> c -> b)
    tanhWs⁺Vh⁺Uf⁺b = tanh.(Ws⁺b .+ keys .+ Uf)
    @ein energies[t,b] := m.w[a] * tanhWs⁺Vh⁺Uf⁺b[a,t,b] # dispatches to batched_contract
    # check: energies == reduce(vcat, [m.w'tanhWs⁺Vh⁺Uf⁺b[:,t,:] for t ∈ axes(tanhWs⁺Vh⁺Uf⁺b,2)])
-   α = softmax(energies)
-   @ein context[d,b] := values[d,t,b] * α[t,b] # dispatches to batched_contract
-   # check: context ≈ reduce(hcat, [sum(α[t,b] * values[:,t,b] for t ∈ axes(values,2)) for b ∈ axes(values,3)])
-   return context, reshape(α, time, 1, batch_size)
+   weights = softmax(energies) # α
+   @ein context[d,b] := values[d,t,b] * weights[t,b] # dispatches to batched_contract
+   # check: context ≈ reduce(hcat, [sum(weights[t,b] * values[:,t,b] for t ∈ axes(values,2)) for b ∈ axes(values,3)])
+   return context, weights
 end
 
 struct PreNet{D<:Dense}
@@ -184,7 +187,7 @@ end
 @functor Tacotron2
 
 function Tacotron2(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_feature,:prenet,:decoding,:melfeatures,:postnet), <:NTuple{8,Integer}},
-   filtersizes::NamedTuple{(:encoding,:postnet),<:NTuple{2,Integer}},
+   filtersizes::NamedTuple{(:encoding,:attention,:postnet),<:NTuple{3,Integer}},
    pdrops::NamedTuple{(:encoding,:prenet,:postnet),<:NTuple{3,AbstractFloat}})
    @assert iseven(dims.encoding)
 
@@ -193,7 +196,7 @@ function Tacotron2(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_fe
    blstm = BLSTM(dims.encoding, dims.encoding÷2)
    encoder = Chain(che, convblock₃.layers..., blstm)
 
-   attention = LocationAwareAttention(dims.encoding, dims.location_feature, dims.attention, dims.decoding)
+   attention = LocationAwareAttention(dims.encoding, dims.location_feature, dims.attention, dims.decoding, filtersizes.attention)
    prenet = PreNet(dims.melfeatures, dims.prenet, pdrops.prenet)
    lstms = Chain(LSTM(dims.prenet + dims.encoding, dims.decoding), LSTM(dims.decoding, dims.decoding))
 
@@ -210,9 +213,10 @@ function Tacotron2(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_fe
 end
 
 function Tacotron2(alphabet,
-   otherdims=(encoding=512, attention=128, location_feature=32, prenet=256, decoding=1024, melfeatures=80, postnet=512), filtersize::Integer=5, pdrop=0.5f0)
+   otherdims=(encoding=512, attention=128, location_feature=32, prenet=256, decoding=1024, melfeatures=80, postnet=512),
+   filtersizes = (encoding=5, attention=31, postnet=5),
+   pdrop=0.5f0)
    dims = merge((alphabet = length(alphabet),), otherdims)
-   filtersizes = (encoding=filtersize, postnet=filtersize)
    pdrops = (encoding=pdrop, prenet=pdrop, postnet=pdrop)
    Tacotron2(dims, filtersizes, pdrops)
 end
@@ -231,72 +235,33 @@ end
 
 
 
+# need to be initialized
+query = zeros(Float32, decoding_dim, batch_size)
+Σweights = zeros(Float32, size(values, 2), 1, batch_size)
+lastframe = zeros(Float32, 80, batch_size)
+
 
 values = m.encoder(textindices)
-V = m.attention.V
-@ein keys[a,t,b] := V[a,d] * values[d,t,b] # dispatches to batched_contract
+@ein keys[a,t,b] := m.attention.V[a,d] * values[d,t,b] # dispatches to batched_contract
 # check: Vh ≈ reduce(hcat, [reshape(m.V * values[:,t,:], size(m.V,1), 1, :) for t ∈ axes(values,2)])
+context, weights = m.attention(values, keys, query, Σweights)
+
+
+
 
 
 mt = deepcopy(m)
 m = m.attention
-dense, F, U, V, w = m.attention.dense, m.attention.F, m.attention.U, m.attention.V, m.attention.w
+m = mt
+
 
 
 decoding_dim = 1024
 batch_size
 
-# need to be initialized
-query = rand(Float32, decoding_dim, batch_size)
-Σweights = zeros(Float32, size(values, 2), 1, batch_size)
-lastframe = zeros(Float32, 80, batch_size)
-
-
-propertynames(mt.attention)
-
-mt.attention.F
-mt.attention.U
-mt.attention.V
-mt.attention.w
-
-function (m::LocationAwareAttention)(values::T, keys::T, query::DenseMatrix, Σweights::T) where T <: DenseArray{<:Real,3}
-   time, _, batch_size = size(Σweights)
-   attention_dim = length(m.w)
-   cdims = DenseConvDims(Σweights, m.F; padding=m.pad)
-   # location features
-   fs = conv(Σweights, m.F, cdims) # F✶Σα
-   @ein Uf[a,t,b] := m.U[a,c] * fs[t,c,b] # dispatches to batched_contract
-   # check: Uf ≈ reduce(hcat, [reshape(m.U * fs[t,:,:], size(m.U,1), 1, :) for t ∈ axes(fs,1)])
-   Ws⁺b = reshape(m.dense(query), attention_dim, 1, batch_size) # (a -> b) & (t -> c -> b)
-   tanhWs⁺Vh⁺Uf⁺b = tanh.(Ws⁺b .+ keys .+ Uf)
-   @ein energies[t,b] := m.w[a] * tanhWs⁺Vh⁺Uf⁺b[a,t,b] # dispatches to batched_contract
-   # check: energies == reduce(vcat, [m.w'tanhWs⁺Vh⁺Uf⁺b[:,t,:] for t ∈ axes(tanhWs⁺Vh⁺Uf⁺b,2)])
-   α = softmax(energies)
-   @ein context[d,b] := values[d,t,b] * α[t,b] # dispatches to batched_contract
-   # check: context ≈ reduce(hcat, [sum(α[t,b] * values[:,t,b] for t ∈ axes(values,2)) for b ∈ axes(values,3)])
-   return context, reshape(α, time, 1, batch_size)
-end
-
-print(sum(α; dims=1))
-
-extrema(sum(α; dims=1))
-using BenchmarkTools
-
-f0(Ws⁺b, keys, Uf) = (tanh.(Ws⁺b .+ (keys + Uf)))
-f1(Ws⁺b, keys, Uf) = (tanh.(Ws⁺b .+ keys .+ Uf))
-
-f0(Ws⁺b, keys, Uf) == f1(Ws⁺b, keys, Uf)
-
-
-@benchmark f0($Ws⁺b, $keys, $Uf)
-@benchmark f1($Ws⁺b, $keys, $Uf)
 
 
 
-
-
-
-tanhWs⁺Vh⁺Uf⁺b = tanh.(Ws⁺b .+ keys + Uf)
 
 
 
