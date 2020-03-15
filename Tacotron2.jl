@@ -218,16 +218,20 @@ function Tacotron2(alphabet,
    Tacotron2(dims, filtersizes, pdrops)
 end
 
-
-
 function Base.show(io::IO, m::Tacotron2)
+   print(io, """Tacotron2(
+                   $(m.encoder),
+                   $(m.attention),
+                   $(m.prenet),
+                   $(m.lstms),
+                   $(m.frameproj),
+                   $(m.stopproj),
+                   $(m.postnet)
+                )""")
 end
 
 
-
 m = Tacotron2(alphabet)
-
-
 
 lstms([prenet(lastframe); context])
 values = encoder(textindices)
