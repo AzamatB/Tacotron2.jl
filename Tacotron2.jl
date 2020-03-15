@@ -235,98 +235,49 @@ function Base.show(io::IO, m::Tacotron2)
 end
 
 function (m::Tacotron2)(textindices::DenseMatrix{<:Integer})
-# dimensions
-time, batchsize = size(textindices)
-decodingdim = size(m.attention.dense.W, 2)
-nmelfeatures = length(m.frameproj.b)
-# encoding
-values = m.encoder(textindices)
-@ein keys[a,t,b] := m.attention.V[a,d] * values[d,t,b] # dispatches to batched_contract (vetted)
-# #=check=# Vh ≈ reduce(hcat, [reshape(m.V * values[:,t,:], size(m.V,1), 1, :) for t ∈ axes(values,2)])
-# initialize parameters
-query    = gpu(zeros(Float32, decodingdim, batchsize))
-weights  = gpu(zeros(Float32, time, batchsize))
-Σweights = gpu(zeros(Float32, time, batchsize))
-frame    = gpu(zeros(Float32, nmelfeatures, batchsize))
-for _ ∈ 1:time
-   context, weights = m.attention(values, keys, query, weights, Σweights)
-   Σweights += weights
-   prenetoutput = m.prenet(frame)
-   decoding = m.lstms([prenetoutput; context])
-   frame = m.frameproj([decoding; context])
-   pstop = m.stopproj([decoding; context])
-   (pstop > 0.5f0) && break
-   @ein frame′[m,b] := frame[m,b] * pstop[u,b] # (vetted)
-   # #=check=# frame′ == reduce(hcat, [pstop[1,b] * frame[:,b] for b ∈ axes(frame,2)])
-end
-
-
-@benchmark f0($pstop, $frame)
-
-@edit OMEinsum.einsum(OMEinsum.EinCode{((1, 2), (3, 2)), (3, 2)}(), (pstop, frame))
-
-function Base.permutedims(B::StridedArray, perm)
-   # @warn "permutedims is called"
-    dimsB = size(B)
-    ndimsB = length(dimsB)
-    (ndimsB == length(perm) && isperm(perm)) || throw(ArgumentError("no valid permutation of dimensions"))
-    dimsP = ntuple(i->dimsB[perm[i]], ndimsB)::typeof(dimsB)
-    P = similar(B, dimsP)
-    permutedims!(P, B, perm)
-end
-
-
-function OMEinsum.batched_contract(iAs, A::AbstractArray, iBs, B::AbstractArray, iOuts::NTuple{NO,T}) where {NO,T}
-   # @warn "batched_contract is called"
-    pA, sAb, sAs, sAp, pB, sBs, sBb, sBp, sAB, pOut = OMEinsum.analyse_batched(iAs, size(A), iBs, size(B), iOuts)
-
-    A, B = OMEinsum.align_eltypes(A, B)
-    Apr = reshape(OMEinsum.conditioned_permutedims(A, pA), sAb, sAs, sAp)
-    Bpr = reshape(OMEinsum.conditioned_permutedims(B, pB), sBs, sBb, sBp)
-    AB = OMEinsum._batched_gemm('N','N', Apr, Bpr)
-    AB = OMEinsum.conditioned_permutedims(reshape(AB, sAB...), [pOut...])
+   # dimensions
+   time, batchsize = size(textindices)
+   decodingdim = size(m.attention.dense.W, 2)
+   nmelfeatures = length(m.frameproj.b)
+   # encoding
+   values = m.encoder(textindices)
+   @ein keys[a,t,b] := m.attention.V[a,d] * values[d,t,b] # dispatches to batched_contract (vetted)
+   # #=check=# Vh ≈ reduce(hcat, [reshape(m.V * values[:,t,:], size(m.V,1), 1, :) for t ∈ axes(values,2)])
+   # initialize parameters
+   query    = gpu(zeros(Float32, decodingdim, batchsize))
+   weights  = gpu(zeros(Float32, time, batchsize))
+   Σweights = gpu(zeros(Float32, time, batchsize))
+   frame    = gpu(zeros(Float32, nmelfeatures, batchsize))
+   # preallocate output buffer
+   prediction_buffer = Buffer(keys, nmelfeatures, batchsize, time)
+   # main autoregressive loop
+   for t ∈ 1:time
+      context, weights = m.attention(values, keys, query, weights, Σweights)
+      Σweights += weights
+      prenetoutput = m.prenet(frame)
+      decoding = m.lstms([prenetoutput; context])
+      frame = m.frameproj([decoding; context])
+      pstop = m.stopproj([decoding; context])
+      # (pstop > 0.5f0) && break
+      prediction_buffer[:,:,t] = pstop .* frame
+      # #=check=# frame′ == reduce(hcat, [pstop[1,b] * frame[:,b] for b ∈ axes(frame,2)])
+   end
+   prediction = permutedims(copy(prediction_buffer), (3,1,2))
+   residue = m.postnet(prediction)
+   return prediction, residue
 end
 
 
 
-m = Tacotron2(alphabet)
 
-
-y: [c×b×t]
-prenet: [c×bt]
-lstms: [c×b×t]
-proj: [c×bt]
-
-
-1
-postnet: [t,c,b]
-1
-y: [c×b×t]
-
-y: [t,c,b]
-1
-prenet: [c×bt]
-lstms: [c×b×t]
-proj: [c×bt]
-1
-
-postnet: [t,c,b]
-y: [t,c,b]
-
-c×b
-context
-
-
-nmels✶batchsize = nmelfeatures*batchsize
-
-
-resize!(reshape(ŷ_last, Val(1)), nmels✶batchsize)
 
 
 datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
 metadatapath = joinpath(datadir, "metadata.csv")
 melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
 
-batchsize = 77
+batchsize = 37
 batches, alphabet = build_batches(metadatapath, melspectrogramspath, batchsize)
 textindices, targets = rand(batches)
+
+m = Tacotron2(alphabet)
