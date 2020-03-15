@@ -1,11 +1,11 @@
-function dropout(x, p)
+function Flux.dropout(x, p)
    q = 1 - p
    y = rand!(similar(x))
    y .= Flux._dropout_kernel.(y, p, q)
    x .* y
 end
 
-@adjoint function dropout(x, p)
+@adjoint function Flux.dropout(x, p)
    q = 1 - p
    y = rand!(similar(x))
    y .= Flux._dropout_kernel.(y, p, q)

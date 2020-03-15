@@ -4,23 +4,23 @@ using FileIO
 using Base.Iterators
 using Random
 
-function build_batches(metadatapath::AbstractString, melspectrogramspath::AbstractString, batch_size::Integer; eos='~', pad='_', kwargs...)
+function build_batches(metadatapath::AbstractString, melspectrogramspath::AbstractString, batchsize::Integer; eos='~', pad='_', kwargs...)
    dataset, alphabet = build_dataset(metadatapath, melspectrogramspath; eos=eos, pad=pad)
-   batches = build_batches!(dataset, alphabet, batch_size, alphabet[eos], alphabet[pad], kwargs...)
+   batches = build_batches!(dataset, alphabet, batchsize, alphabet[eos], alphabet[pad], kwargs...)
    return batches, alphabet
 end
 
-build_batches(dataset::AbstractVector{<:Tuple{AbstractString,DenseMatrix{Float32}}}, alphabet::AbstractDict{Char,<:Integer}, batch_size::Integer, eosindex::Integer, padindex::Integer; kwargs...) =
-   build_batches!(copy(dataset), alphabet, batch_size, eosindex, padindex; kwargs...)
+build_batches(dataset::AbstractVector{<:Tuple{AbstractString,DenseMatrix{Float32}}}, alphabet::AbstractDict{Char,<:Integer}, batchsize::Integer, eosindex::Integer, padindex::Integer; kwargs...) =
+   build_batches!(copy(dataset), alphabet, batchsize, eosindex, padindex; kwargs...)
 
 function build_batches!(dataset::AbstractVector{<:Tuple{AbstractString,DenseMatrix{Float32}}},
                         alphabet::AbstractDict{Char,<:Integer},
-                        batch_size::Integer,
+                        batchsize::Integer,
                         eosindex::Integer,
                         padindex::Integer;
                         sorted=false, reorder=true)
    sorted || sort!(dataset; by=length∘first)
-   batches = map(partition(dataset, batch_size)) do batch
+   batches = map(partition(dataset, batchsize)) do batch
       pad_batch(batch, alphabet, eosindex, padindex; sorted=true, reorder=reorder)
    end
    reorder && shuffle!(batches)
@@ -28,14 +28,14 @@ function build_batches!(dataset::AbstractVector{<:Tuple{AbstractString,DenseMatr
 end
 
 function pad_batch(batch::AbstractVector{<:Tuple{String,DenseMatrix{Float32}}}, alphabet::AbstractDict{Char,<:Integer}, eosindex::Integer, padindex::Integer; sorted=false, reorder=true)
-   batch_size = length(batch)
+   batchsize = length(batch)
    maxlength_x = 1 + (sorted ? (length∘first∘last)(batch) : maximum(length∘first, batch))
    maxlength_y = maximum(xy -> size(last(xy), 1), batch)
    nchannels_y = size(last(first(batch)), 2)
 
    reorder && (batch = shuffle(batch))
-   textindices = fill(padindex, maxlength_x, batch_size)
-   melspectrograms = zeros(Float32, maxlength_y, nchannels_y, batch_size)
+   textindices = fill(padindex, maxlength_x, batchsize)
+   melspectrograms = zeros(Float32, maxlength_y, nchannels_y, batchsize)
 
    for (batchidx, (text, melspectrogram)) ∈ enumerate(batch)
       melspectrograms[axes(melspectrogram,1),:,batchidx] = melspectrogram

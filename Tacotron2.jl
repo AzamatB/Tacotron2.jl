@@ -5,6 +5,7 @@ using Zygote: Buffer, @adjoint
 using OMEinsum
 using NamedTupleTools
 
+include("utils.jl")
 include("dataprepLJSpeech/dataprep.jl")
 
 struct CharEmbedding{M <: DenseMatrix}
@@ -13,22 +14,22 @@ end
 
 @functor CharEmbedding
 
-CharEmbedding(alphabet_size::Integer, embedding_dim=512) = CharEmbedding(gpu(Dense(alphabet_size, embedding_dim).W))
-function CharEmbedding(alphabet, embedding_dim=512)
-   alphabet_size = length(alphabet)
-   CharEmbedding(alphabet_size, embedding_dim)
+CharEmbedding(alphabetsize::Integer, embeddingdim=512) = CharEmbedding(gpu(Dense(alphabetsize, embeddingdim).W))
+function CharEmbedding(alphabet, embeddingdim=512)
+   alphabetsize = length(alphabet)
+   CharEmbedding(alphabetsize, embeddingdim)
 end
 
 function Base.show(io::IO, m::CharEmbedding)
-   embedding_dim, alphabet_size = size(m.embedding)
-   print(io, "CharEmbedding($alphabet_size, $embedding_dim)")
+   embeddingdim, alphabetsize = size(m.embedding)
+   print(io, "CharEmbedding($alphabetsize, $embeddingdim)")
 end
 
 (m::CharEmbedding)(charidxs::Integer) = m.embedding[:,charidxs]
 function (m::CharEmbedding)(indices::DenseMatrix{<:Integer})
-   time, batch_size = size(indices)
-   embedding_dim = size(m.embedding, 1)
-   output = permutedims(reshape(m.embedding[:,reshape(indices, Val(1))], embedding_dim, time, batch_size), (2,1,3))
+   time, batchsize = size(indices)
+   embeddingdim = size(m.embedding, 1)
+   output = permutedims(reshape(m.embedding[:,reshape(indices, Val(1))], embeddingdim, time, batchsize), (2,1,3))
    # #=check=# output == permutedims(cat(map(eachcol(indices)) do indicesᵢ
    #    m.embedding[:,indicesᵢ]
    # end...; dims=3), (2,1,3))
@@ -114,40 +115,40 @@ end
 
 @functor LocationAwareAttention (dense, F, U, V, w)
 
-function LocationAwareAttention(encoding_dim=512, location_feature_dim=32, attention_dim=128, decoding_dim=1024, filtersize=31)
+function LocationAwareAttention(encodingdim=512, location_featuredim=32, attentiondim=128, decodingdim=1024, filtersize=31)
    @assert isodd(filtersize)
-   dense = Dense(decoding_dim, attention_dim)
-   convF = Conv((filtersize,), 2=>location_feature_dim, pad = (filtersize-1)÷2)
-   denseU = Dense(location_feature_dim, attention_dim)
-   denseV = Dense(encoding_dim, attention_dim)
-   densew = Dense(attention_dim, 1)
+   dense = Dense(decodingdim, attentiondim)
+   convF = Conv((filtersize,), 2=>location_featuredim, pad = (filtersize-1)÷2)
+   denseU = Dense(location_featuredim, attentiondim)
+   denseV = Dense(encodingdim, attentiondim)
+   densew = Dense(attentiondim, 1)
    LocationAwareAttention(gpu(dense), convF.pad, gpu(convF.weight), gpu(denseU.W), gpu(denseV.W), gpu(vec(densew.W)))
 end
 
 function Base.show(io::IO, m::LocationAwareAttention)
-   encoding_dim = size(m.V, 2)
-   location_feature_dim = size(m.F, 3)
-   attention_dim, decoding_dim = size(m.dense.W)
-   print(io, "LocationAwareAttention($encoding_dim, $location_feature_dim, $attention_dim, $decoding_dim)")
+   encodingdim = size(m.V, 2)
+   location_featuredim = size(m.F, 3)
+   attentiondim, decodingdim = size(m.dense.W)
+   print(io, "LocationAwareAttention($encodingdim, $location_featuredim, $attentiondim, $decodingdim)")
 end
 
 function (m::LocationAwareAttention)(values::T, keys::T, query::M, lastweights::M, Σweights::M) where {T <: DenseArray{<:Real,3}, M <: DenseMatrix}
-   time, batch_size = size(Σweights)
-   attention_dim = length(m.w)
-   rdims = (time, 1, batch_size)
+   time, batchsize = size(Σweights)
+   attentiondim = length(m.w)
+   rdims = (time, 1, batchsize)
    weights_cat = [reshape(lastweights, rdims) reshape(Σweights, rdims)]
    cdims = DenseConvDims(weights_cat, m.F; padding=m.pad)
    # location features
    fs = conv(weights_cat, m.F, cdims) # F✶weights_cat
-   @ein Uf[a,t,b] := m.U[a,c] * fs[t,c,b] # dispatches to batched_contract
-   # check: Uf ≈ reduce(hcat, [reshape(m.U * fs[t,:,:], size(m.U,1), 1, :) for t ∈ axes(fs,1)])
-   Ws⁺b = reshape(m.dense(query), attention_dim, 1, batch_size) # (a -> b) & (t -> c -> b)
+   @ein Uf[a,t,b] := m.U[a,c] * fs[t,c,b] # dispatches to batched_contract (vetted)
+   # #=check=# Uf ≈ reduce(hcat, [reshape(m.U * fs[t,:,:], size(m.U,1), 1, :) for t ∈ axes(fs,1)])
+   Ws⁺b = reshape(m.dense(query), attentiondim, 1, batchsize) # (a -> b) & (t -> c -> b)
    tanhWs⁺Vh⁺Uf⁺b = tanh.(Ws⁺b .+ keys .+ Uf)
-   @ein energies[t,b] := m.w[a] * tanhWs⁺Vh⁺Uf⁺b[a,t,b] # dispatches to batched_contract
-   # check: energies == reduce(vcat, [m.w'tanhWs⁺Vh⁺Uf⁺b[:,t,:] for t ∈ axes(tanhWs⁺Vh⁺Uf⁺b,2)])
+   @ein energies[t,b] := m.w[a] * tanhWs⁺Vh⁺Uf⁺b[a,t,b] # dispatches to batched_contract (vetted)
+   # #=check=# energies == reduce(vcat, [m.w'tanhWs⁺Vh⁺Uf⁺b[:,t,:] for t ∈ axes(tanhWs⁺Vh⁺Uf⁺b,2)])
    weights = softmax(energies) # α
-   @ein context[d,b] := values[d,t,b] * weights[t,b] # dispatches to batched_contract
-   # check: context ≈ reduce(hcat, [sum(weights[t,b] * values[:,t,b] for t ∈ axes(values,2)) for b ∈ axes(values,3)])
+   @ein context[d,b] := values[d,t,b] * weights[t,b] # dispatches to batched_contract (vetted)
+   # #=check=# context ≈ reduce(hcat, [sum(weights[t,b] * values[:,t,b] for t ∈ axes(values,2)) for b ∈ axes(values,3)])
    return context, weights
 end
 
@@ -233,46 +234,63 @@ function Base.show(io::IO, m::Tacotron2)
                 )""")
 end
 
+function (m::Tacotron2)(textindices::DenseMatrix{<:Integer})
+# dimensions
+time, batchsize = size(textindices)
+decodingdim = size(m.attention.dense.W, 2)
+nmelfeatures = length(m.frameproj.b)
+# encoding
+values = m.encoder(textindices)
+@ein keys[a,t,b] := m.attention.V[a,d] * values[d,t,b] # dispatches to batched_contract (vetted)
+# #=check=# Vh ≈ reduce(hcat, [reshape(m.V * values[:,t,:], size(m.V,1), 1, :) for t ∈ axes(values,2)])
+# initialize parameters
+query    = gpu(zeros(Float32, decodingdim, batchsize))
+weights  = gpu(zeros(Float32, time, batchsize))
+Σweights = gpu(zeros(Float32, time, batchsize))
+frame    = gpu(zeros(Float32, nmelfeatures, batchsize))
+for _ ∈ 1:time
+   context, weights = m.attention(values, keys, query, weights, Σweights)
+   Σweights += weights
+   prenetoutput = m.prenet(frame)
+   decoding = m.lstms([prenetoutput; context])
+   frame = m.frameproj([decoding; context])
+   pstop = m.stopproj([decoding; context])
+   (pstop > 0.5f0) && break
+   @ein frame′[m,b] := frame[m,b] * pstop[u,b] # (vetted)
+   # #=check=# frame′ == reduce(hcat, [pstop[1,b] * frame[:,b] for b ∈ axes(frame,2)])
+end
 
 
-# need to be initialized
-decoding_dim=1024
-query = zeros(Float32, decoding_dim, batch_size)
-lastweights = zeros(Float32, size(values1, 2), batch_size)
-Σweights = zeros(Float32, size(values1, 2), batch_size)
-lastframe = zeros(Float32, 80, batch_size)
+@benchmark f0($pstop, $frame)
+
+@edit OMEinsum.einsum(OMEinsum.EinCode{((1, 2), (3, 2)), (3, 2)}(), (pstop, frame))
+
+function Base.permutedims(B::StridedArray, perm)
+   # @warn "permutedims is called"
+    dimsB = size(B)
+    ndimsB = length(dimsB)
+    (ndimsB == length(perm) && isperm(perm)) || throw(ArgumentError("no valid permutation of dimensions"))
+    dimsP = ntuple(i->dimsB[perm[i]], ndimsB)::typeof(dimsB)
+    P = similar(B, dimsP)
+    permutedims!(P, B, perm)
+end
 
 
-values1 = m.encoder(textindices)
-@ein keys[a,t,b] := m.attention.V[a,d] * values1[d,t,b] # dispatches to batched_contract
-# check: Vh ≈ reduce(hcat, [reshape(m.V * values1[:,t,:], size(m.V,1), 1, :) for t ∈ axes(values1,2)])
-context, weights = m.attention(values1, keys, query, lastweights, Σweights)
+function OMEinsum.batched_contract(iAs, A::AbstractArray, iBs, B::AbstractArray, iOuts::NTuple{NO,T}) where {NO,T}
+   # @warn "batched_contract is called"
+    pA, sAb, sAs, sAp, pB, sBs, sBb, sBp, sAB, pOut = OMEinsum.analyse_batched(iAs, size(A), iBs, size(B), iOuts)
 
-Σweights += weights
-lastweights = weights
-
-
-
-mt = deepcopy(m)
-m = m.attention
-m = mt
-
-
-
-decoding_dim = 1024
-batch_size
-
-
-
-
-
-
+    A, B = OMEinsum.align_eltypes(A, B)
+    Apr = reshape(OMEinsum.conditioned_permutedims(A, pA), sAb, sAs, sAp)
+    Bpr = reshape(OMEinsum.conditioned_permutedims(B, pB), sBs, sBb, sBp)
+    AB = OMEinsum._batched_gemm('N','N', Apr, Bpr)
+    AB = OMEinsum.conditioned_permutedims(reshape(AB, sAB...), [pOut...])
+end
 
 
 
 m = Tacotron2(alphabet)
 
-lstms([prenet(lastframe); context])
 
 y: [c×b×t]
 prenet: [c×bt]
@@ -299,37 +317,16 @@ c×b
 context
 
 
-nmels✶batch_size = nmelfeatures*batch_size
+nmels✶batchsize = nmelfeatures*batchsize
 
 
-ŷ_last = permutedims(ŷ_last, (2,3,1))
-
-resize!(reshape(ŷ_last, Val(1)), nmels✶batch_size)
-
-
+resize!(reshape(ŷ_last, Val(1)), nmels✶batchsize)
 
 
 datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
 metadatapath = joinpath(datadir, "metadata.csv")
 melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
 
-batch_size = 77
-batches, alphabet = build_batches(metadatapath, melspectrogramspath, batch_size)
+batchsize = 77
+batches, alphabet = build_batches(metadatapath, melspectrogramspath, batchsize)
 textindices, targets = rand(batches)
-
-
-x = che(textindices)
-x = cb3(x)
-x = blstm(x)
-decoding_dim = 1024
-attention_dim = 512
-out_dim = 80
-x_prenet = prenet(ŷ_last)
-
-targets
-
-x = lstms([x_prenet; context])
-
-x_cat_context = [x; context]
-frame = pred_projection(x_cat_context)
-pstop = stop_projection(x_cat_context)
