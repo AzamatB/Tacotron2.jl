@@ -19,8 +19,8 @@ function CharEmbedding(alphabet, embedding_dim=512)
    CharEmbedding(alphabet_size, embedding_dim)
 end
 
-function Base.show(io::IO, l::CharEmbedding)
-   embedding_dim, alphabet_size = size(l.embedding)
+function Base.show(io::IO, m::CharEmbedding)
+   embedding_dim, alphabet_size = size(m.embedding)
    print(io, "CharEmbedding($alphabet_size, $embedding_dim)")
 end
 
@@ -64,9 +64,9 @@ function BLSTM(in::Integer, out::Integer)
    return BLSTM(gpu(forward), gpu(backward), out)
 end
 
-function Base.show(io::IO, l::BLSTM)
-   in = size(l.forward.cell.Wi, 2)
-   out = l.outdim
+function Base.show(io::IO, m::BLSTM)
+   in = size(m.forward.cell.Wi, 2)
+   out = m.outdim
    print(io, "BLSTM($in, $out)")
 end
 
@@ -122,10 +122,10 @@ function LocationAwareAttention(encoding_dim=512, location_feature_dim=32, atten
    LocationAwareAttention(gpu(dense), convF.pad, gpu(convF.weight), gpu(denseU.W), gpu(denseV.W), gpu(vec(densew.W)))
 end
 
-function Base.show(io::IO, l::LocationAwareAttention)
-   encoding_dim = size(l.V, 2)
-   location_feature_dim = size(l.F, 3)
-   attention_dim, decoding_dim = size(l.dense.W)
+function Base.show(io::IO, m::LocationAwareAttention)
+   encoding_dim = size(m.V, 2)
+   location_feature_dim = size(m.F, 3)
+   attention_dim, decoding_dim = size(m.dense.W)
    print(io, "LocationAwareAttention($encoding_dim, $location_feature_dim, $attention_dim, $decoding_dim)")
 end
 
@@ -162,10 +162,10 @@ function PreNet(in::Integer, out::Integer=256, pdrop=0.5f0, σ=leakyrelu)
    PreNet(Dense(in, out, σ) |> gpu, Dense(out, out, σ) |> gpu, Float32(pdrop))
 end
 
-function Base.show(io::IO, l::PreNet)
-   out, in = size(l.dense₁.W)
-   pdrop = l.pdrop
-   σ = l.dense₁.σ
+function Base.show(io::IO, m::PreNet)
+   out, in = size(m.dense₁.W)
+   pdrop = m.pdrop
+   σ = m.dense₁.σ
    print(io, "PreNet($in, $out, $pdrop, $σ)")
 end
 
@@ -216,6 +216,11 @@ function Tacotron2(alphabet,
    filtersizes = (encoding=filtersize, postnet=filtersize)
    pdrops = (encoding=pdrop, prenet=pdrop, postnet=pdrop)
    Tacotron2(dims, filtersizes, pdrops)
+end
+
+
+
+function Base.show(io::IO, m::Tacotron2)
 end
 
 
