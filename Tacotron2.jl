@@ -131,11 +131,11 @@ function Base.show(io::IO, m::LocationAwareAttention)
    print(io, "LocationAwareAttention($encoding_dim, $location_feature_dim, $attention_dim, $decoding_dim)")
 end
 
-function (m::LocationAwareAttention)(values::T, keys::T, query::M, Σweights::M, weightsᵢ₋₁::M) where {T <: DenseArray{<:Real,3}, M <: DenseMatrix}
+function (m::LocationAwareAttention)(values::T, keys::T, query::M, lastweights::M, Σweights::M) where {T <: DenseArray{<:Real,3}, M <: DenseMatrix}
    time, batch_size = size(Σweights)
    attention_dim = length(m.w)
    rdims = (time, 1, batch_size)
-   weights_cat = [reshape(Σweights, rdims) reshape(weightsᵢ₋₁, rdims)]
+   weights_cat = [reshape(lastweights, rdims) reshape(Σweights, rdims)]
    cdims = DenseConvDims(weights_cat, m.F; padding=m.pad)
    # location features
    fs = conv(weights_cat, m.F, cdims) # F✶weights_cat
@@ -236,17 +236,20 @@ end
 
 
 # need to be initialized
+decoding_dim=1024
 query = zeros(Float32, decoding_dim, batch_size)
-Σweights = zeros(Float32, size(values, 2), 1, batch_size)
+lastweights = zeros(Float32, size(values1, 2), batch_size)
+Σweights = zeros(Float32, size(values1, 2), batch_size)
 lastframe = zeros(Float32, 80, batch_size)
 
 
-values = m.encoder(textindices)
-@ein keys[a,t,b] := m.attention.V[a,d] * values[d,t,b] # dispatches to batched_contract
-# check: Vh ≈ reduce(hcat, [reshape(m.V * values[:,t,:], size(m.V,1), 1, :) for t ∈ axes(values,2)])
-context, weights = m.attention(values, keys, query, Σweights)
+values1 = m.encoder(textindices)
+@ein keys[a,t,b] := m.attention.V[a,d] * values1[d,t,b] # dispatches to batched_contract
+# check: Vh ≈ reduce(hcat, [reshape(m.V * values1[:,t,:], size(m.V,1), 1, :) for t ∈ axes(values1,2)])
+context, weights = m.attention(values1, keys, query, lastweights, Σweights)
 
-
+Σweights += weights
+lastweights = weights
 
 
 
@@ -270,8 +273,6 @@ batch_size
 m = Tacotron2(alphabet)
 
 lstms([prenet(lastframe); context])
-values = encoder(textindices)
-context, weights = attention(values, query, Σweights)
 
 y: [c×b×t]
 prenet: [c×bt]
@@ -325,8 +326,6 @@ attention_dim = 512
 out_dim = 80
 x_prenet = prenet(ŷ_last)
 
-
-Σweights += weights
 targets
 
 x = lstms([x_prenet; context])
