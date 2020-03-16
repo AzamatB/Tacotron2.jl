@@ -132,11 +132,13 @@ function Base.show(io::IO, m::LocationAwareAttention)
    print(io, "LocationAwareAttention($encodingdim, $location_featuredim, $attentiondim, $decodingdim)")
 end
 
-function (m::LocationAwareAttention)(values::T, keys::T, query::M, lastweights::M, Σweights::M) where {T <: DenseArray{<:Real,3}, M <: DenseMatrix}
-   time, batchsize = size(Σweights)
+function (m::LocationAwareAttention)(values::T, keys::T, query::DenseMatrix, lastweights::T, Σweights::T) where T <: DenseArray{<:Real,3}
+   rdims = size(Σweights)
+   time, _, batchsize = rdims
    attentiondim = length(m.w)
-   rdims = (time, 1, batchsize)
-   weights_cat = [reshape(lastweights, rdims) reshape(Σweights, rdims)]
+   # weights_cat = [lastweights Σweights]
+   # errors during gradient calculation; the workaround is to use cat instead of hcat:
+   weights_cat = cat(lastweights Σweights; dims=2)
    cdims = DenseConvDims(weights_cat, m.F; padding=m.pad)
    # location features
    fs = conv(weights_cat, m.F, cdims) # F✶weights_cat
@@ -149,7 +151,7 @@ function (m::LocationAwareAttention)(values::T, keys::T, query::M, lastweights::
    weights = softmax(energies) # α
    @ein context[d,b] := values[d,t,b] * weights[t,b] # dispatches to batched_contract (vetted)
    # #=check=# context ≈ reduce(hcat, [sum(weights[t,b] * values[:,t,b] for t ∈ axes(values,2)) for b ∈ axes(values,3)])
-   return context, weights
+   return context, reshape(weights, rdims)
 end
 
 struct PreNet{D<:Dense}
@@ -245,8 +247,8 @@ function (m::Tacotron2)(textindices::DenseMatrix{<:Integer})
    # #=check=# Vh ≈ reduce(hcat, [reshape(m.V * values[:,t,:], size(m.V,1), 1, :) for t ∈ axes(values,2)])
    # initialize parameters
    query    = gpu(zeros(Float32, decodingdim, batchsize))
-   weights  = gpu(zeros(Float32, time, batchsize))
-   Σweights = gpu(zeros(Float32, time, batchsize))
+   weights  = gpu(zeros(Float32, time, 1, batchsize))
+   Σweights = gpu(zeros(Float32, time, 1, batchsize))
    frame    = gpu(zeros(Float32, nmelfeatures, batchsize))
    # preallocate output buffer
    prediction_buffer = Buffer(keys, nmelfeatures, batchsize, time)
@@ -256,8 +258,9 @@ function (m::Tacotron2)(textindices::DenseMatrix{<:Integer})
       Σweights += weights
       prenetoutput = m.prenet(frame)
       decoding = m.lstms([prenetoutput; context])
-      frame = m.frameproj([decoding; context])
-      pstop = m.stopproj([decoding; context])
+      decoding_context = [decoding; context]
+      frame = m.frameproj(decoding_context)
+      pstop = m.stopproj(decoding_context)
       # (pstop > 0.5f0) && break
       prediction_buffer[:,:,t] = pstop .* frame
       # #=check=# frame′ == reduce(hcat, [pstop[1,b] * frame[:,b] for b ∈ axes(frame,2)])
