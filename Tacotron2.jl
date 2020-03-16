@@ -1,3 +1,4 @@
+using CuArrays
 using Flux
 using Flux: @functor, Recur, LSTMCell, dropout, mse, logitbinarycrossentropy
 using Zygote
@@ -5,6 +6,8 @@ using Zygote: Buffer, @adjoint
 using OMEinsum
 using NamedTupleTools
 using Statistics
+
+CuArrays.allowscalar(false)
 
 include("utils.jl")
 include("dataprepLJSpeech/dataprep.jl")
@@ -116,9 +119,9 @@ end
 
 @functor LocationAwareAttention (dense, F, U, V, w)
 
-function LocationAwareAttention(encodingdim=512, location_featuredim=32, attentiondim=128, decodingdim=1024, filtersize=31)
+function LocationAwareAttention(encodingdim=512, location_featuredim=32, attentiondim=128, querydim=1024, filtersize=31)
    @assert isodd(filtersize)
-   dense = Dense(decodingdim, attentiondim)
+   dense = Dense(querydim, attentiondim)
    convF = Conv((filtersize,), 2=>location_featuredim, pad = (filtersize-1)÷2)
    denseU = Dense(location_featuredim, attentiondim)
    denseV = Dense(encodingdim, attentiondim)
@@ -129,8 +132,8 @@ end
 function Base.show(io::IO, m::LocationAwareAttention)
    encodingdim = size(m.V, 2)
    location_featuredim = size(m.F, 3)
-   attentiondim, decodingdim = size(m.dense.W)
-   print(io, "LocationAwareAttention($encodingdim, $location_featuredim, $attentiondim, $decodingdim)")
+   attentiondim, querydim = size(m.dense.W)
+   print(io, "LocationAwareAttention($encodingdim, $location_featuredim, $attentiondim, $querydim)")
 end
 
 function (m::LocationAwareAttention)(values::T, keys::T, query::DenseMatrix, lastweights::T, Σweights::T) where T <: DenseArray{<:Real,3}
@@ -190,7 +193,7 @@ end
 
 @functor Tacotron2
 
-function Tacotron2(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_feature,:prenet,:decoding,:melfeatures,:postnet), <:NTuple{8,Integer}},
+function Tacotron2(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_feature,:prenet,:query,:melfeatures,:postnet), <:NTuple{8,Integer}},
    filtersizes::NamedTuple{(:encoding,:attention,:postnet),<:NTuple{3,Integer}},
    pdrops::NamedTuple{(:encoding,:prenet,:postnet),<:NTuple{3,AbstractFloat}})
    @assert iseven(dims.encoding)
@@ -200,13 +203,13 @@ function Tacotron2(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_fe
    blstm = BLSTM(dims.encoding, dims.encoding÷2)
    encoder = Chain(che, convblock₃.layers..., blstm)
 
-   attention = LocationAwareAttention(dims.encoding, dims.location_feature, dims.attention, dims.decoding, filtersizes.attention)
+   attention = LocationAwareAttention(dims.encoding, dims.location_feature, dims.attention, dims.query, filtersizes.attention)
    prenet = PreNet(dims.melfeatures, dims.prenet, pdrops.prenet)
-   lstms = Chain(LSTM(dims.prenet + dims.encoding, dims.decoding), LSTM(dims.decoding, dims.decoding))
+   lstms = Chain(LSTM(dims.prenet + dims.encoding, dims.query), LSTM(dims.query, dims.query))
 
-   frameproj = Dense(dims.decoding + dims.encoding, dims.melfeatures)
+   frameproj = Dense(dims.query + dims.encoding, dims.melfeatures)
    # will apply sigmoid implicitly during loss calculation with logitbinarycrossentropy for numerical stability
-   stopproj = Dense(dims.decoding + dims.encoding, 1 #=, σ =#)
+   stopproj = Dense(dims.query + dims.encoding, 1 #=, σ =#)
 
    nchmel, nch, fs, pdrop = dims.melfeatures, dims.postnet, filtersizes.postnet, pdrops.postnet
    postnet = Chain([convblock(nchmel=>nch, tanh, fs, pdrop);
@@ -218,7 +221,7 @@ function Tacotron2(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_fe
 end
 
 function Tacotron2(alphabet,
-   otherdims=(encoding=512, attention=128, location_feature=32, prenet=256, decoding=1024, melfeatures=80, postnet=512),
+   otherdims=(encoding=512, attention=128, location_feature=32, prenet=256, query=1024, melfeatures=80, postnet=512),
    filtersizes = (encoding=5, attention=31, postnet=5),
    pdrop=0.5f0)
    dims = merge((alphabet = length(alphabet),), otherdims)
@@ -246,14 +249,14 @@ end
 function (m::Tacotron2)(textindices::DenseMatrix{<:Integer}, time_out::Integer)
    # dimensions
    time_in, batchsize = size(textindices)
-   decodingdim = size(m.attention.dense.W, 2)
+   querydim = size(m.attention.dense.W, 2)
    nmelfeatures = length(m.frameproj.b)
    # encoding
    values = m.encoder(textindices)
    @ein keys[a,t,b] := m.attention.V[a,d] * values[d,t,b] # dispatches to batched_contract (vetted)
    # #=check=# Vh ≈ reduce(hcat, [reshape(m.V * values[:,t,:], size(m.V,1), 1, :) for t ∈ axes(values,2)])
    # initialize parameters
-   query    = gpu(zeros(Float32, decodingdim, batchsize))
+   query    = gpu(zeros(Float32, querydim, batchsize))
    weights  = gpu(zeros(Float32, time_in, 1, batchsize))
    Σweights = gpu(zeros(Float32, time_in, 1, batchsize))
    frame    = gpu(zeros(Float32, nmelfeatures, batchsize))
@@ -265,11 +268,11 @@ function (m::Tacotron2)(textindices::DenseMatrix{<:Integer}, time_out::Integer)
       context, weights = m.attention(values, keys, query, weights, Σweights)
       Σweights += weights
       prenetoutput = m.prenet(frame)
-      decoding = m.lstms([prenetoutput; context])
-      decoding_context = [decoding; context]
-      frame = m.frameproj(decoding_context)
-      σ⁻¹pstop = m.stopproj(decoding_context)
-      σ⁻¹stoprobs′[:,t] = reshape(σ⁻¹pstop, Val(1))
+      query = m.lstms([prenetoutput; context])
+      query_context = [query; context]
+      frame = m.frameproj(query_context)
+      σ⁻¹pstopᵀ = m.stopproj(query_context)
+      σ⁻¹stoprobs′[:,t] = reshape(σ⁻¹pstopᵀ, Val(1))
       prediction[:,:,t] = frame
    end
    σ⁻¹stoprobs = copy(σ⁻¹stoprobs′)
@@ -277,7 +280,6 @@ function (m::Tacotron2)(textindices::DenseMatrix{<:Integer}, time_out::Integer)
    melprediction⁺residual = melprediction + m.postnet(melprediction)
    return melprediction, melprediction⁺residual, σ⁻¹stoprobs
 end
-
 
 function loss(model::Tacotron2, textindices::DenseMatrix{<:Integer}, meltarget::DenseArray{<:Real,3}, stoptarget::DenseMatrix{<:Real})
    melprediction, melprediction⁺residual, σ⁻¹stoprobs = model(textindices, size(meltarget, 1))
@@ -292,7 +294,7 @@ loss(model::Tacotron2, (textindices, meltarget, stoptarget)::Tuple{DenseMatrix{<
 # TODO 3. add implement iterators to get rid of the Buffer code in the forward pass
 # TODO 4. add adjoint for hcat of 2 3D tensors and replace cat with hcat in the attentions forward pass
 
-grads = let
+gs = let
 datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
 metadatapath = joinpath(datadir, "metadata.csv")
 melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
@@ -301,9 +303,9 @@ batchsize = 11
 batches, alphabet = build_batches(metadatapath, melspectrogramspath, batchsize)
 batch = batches[argmin(map(x -> size(last(x), 2), batches))]
 textindices, meltarget, stoptarget = batch
+time_out = size(stoptarget, 2)
 
 loss(m, batch)
-
 
 
 

@@ -1,3 +1,8 @@
+vectorof(::Type{<:Array{T}}) where T = Vector{T}
+matrixof(::Type{<:Array{T}}) where T = Matrix{T}
+vectorof(::Type{<:CuArray{T}}) where T = CuVector{T,Nothing}
+matrixof(::Type{<:CuArray{T}}) where T = CuMatrix{T,Nothing}
+
 function Flux.dropout(x, p)
    q = 1 - p
    y = rand!(similar(x))
