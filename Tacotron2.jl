@@ -138,7 +138,7 @@ function (m::LocationAwareAttention)(values::T, keys::T, query::DenseMatrix, las
    attentiondim = length(m.w)
    # weights_cat = [lastweights Σweights]
    # errors during gradient calculation; the workaround is to use cat instead of hcat:
-   weights_cat = cat(lastweights Σweights; dims=2)
+   weights_cat = cat(lastweights, Σweights; dims=2)
    cdims = DenseConvDims(weights_cat, m.F; padding=m.pad)
    # location features
    fs = conv(weights_cat, m.F, cdims) # F✶weights_cat
@@ -263,6 +263,8 @@ function (m::Tacotron2)(textindices::DenseMatrix{<:Integer})
       pstop = m.stopproj(decoding_context)
       # (pstop > 0.5f0) && break
       prediction_buffer[:,:,t] = pstop .* frame
+      # @ein frame′[m,b] := frame[m,b] * pstop[u,b]; prediction_buffer[:,:,t] = frame′ # (vetted)
+      # prediction_buffer[:,:,t] = einsum(EinCode{((1, 2), (3, 2)), (1, 2)}(), (frame, pstop))
       # #=check=# frame′ == reduce(hcat, [pstop[1,b] * frame[:,b] for b ∈ axes(frame,2)])
    end
    prediction = permutedims(copy(prediction_buffer), (3,1,2))
