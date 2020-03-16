@@ -30,21 +30,23 @@ end
 function pad_batch(batch::AbstractVector{<:Tuple{String,DenseMatrix{Float32}}}, alphabet::AbstractDict{Char,<:Integer}, eosindex::Integer, padindex::Integer; sorted=false, reorder=true)
    batchsize = length(batch)
    maxlength_x = 1 + (sorted ? (length∘first∘last)(batch) : maximum(length∘first, batch))
-   maxlength_y = maximum(xy -> size(last(xy), 1), batch)
+   reorder && shuffle!(batch)
+
+   melspectrogram_lengths = map(xy -> size(last(xy), 1), batch)
+   maxlength_y = maximum(melspectrogram_lengths)
    nchannels_y = size(last(first(batch)), 2)
 
-   reorder && (batch = shuffle(batch))
    textindices = fill(padindex, maxlength_x, batchsize)
    melspectrograms = zeros(Float32, maxlength_y, nchannels_y, batchsize)
 
-   for (batchidx, (text, melspectrogram)) ∈ enumerate(batch)
-      melspectrograms[axes(melspectrogram,1),:,batchidx] = melspectrogram
+   for (n, (text, melspectrogram)) ∈ enumerate(batch)
+      melspectrograms[axes(melspectrogram,1),:,n] = melspectrogram
       for (i, char) ∈ enumerate(text)
-         textindices[i,batchidx] = alphabet[char]
+         textindices[i,n] = alphabet[char]
       end
-      textindices[length(text)+1,batchidx] = eosindex
+      textindices[length(text)+1,n] = eosindex
    end
-   return textindices, melspectrograms
+   return textindices, melspectrograms, melspectrogram_lengths
 end
 
 function build_dataset(metadatapath::AbstractString, melspectrogramspath::AbstractString; eos='~', pad='_')
