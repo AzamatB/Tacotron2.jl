@@ -1,9 +1,10 @@
 using Flux
-using Flux: @functor, Recur, LSTMCell, dropout
+using Flux: @functor, Recur, LSTMCell, dropout, mse, logitbinarycrossentropy
 using Zygote
 using Zygote: Buffer, @adjoint
 using OMEinsum
 using NamedTupleTools
+using Statistics
 
 include("utils.jl")
 include("dataprepLJSpeech/dataprep.jl")
@@ -242,9 +243,9 @@ function Flux.reset!(m::Tacotron2)
    Flux.reset!(m.lstms)
 end
 
-function (m::Tacotron2)(textindices::DenseMatrix{<:Integer})
+function (m::Tacotron2)(textindices::DenseMatrix{<:Integer}, time_out::Integer)
    # dimensions
-   time, batchsize = size(textindices)
+   time_in, batchsize = size(textindices)
    decodingdim = size(m.attention.dense.W, 2)
    nmelfeatures = length(m.frameproj.b)
    # encoding
@@ -253,21 +254,22 @@ function (m::Tacotron2)(textindices::DenseMatrix{<:Integer})
    # #=check=# Vh ≈ reduce(hcat, [reshape(m.V * values[:,t,:], size(m.V,1), 1, :) for t ∈ axes(values,2)])
    # initialize parameters
    query    = gpu(zeros(Float32, decodingdim, batchsize))
-   weights  = gpu(zeros(Float32, time, 1, batchsize))
-   Σweights = gpu(zeros(Float32, time, 1, batchsize))
+   weights  = gpu(zeros(Float32, time_in, 1, batchsize))
+   Σweights = gpu(zeros(Float32, time_in, 1, batchsize))
    frame    = gpu(zeros(Float32, nmelfeatures, batchsize))
    # preallocate output buffer
-   prediction = Buffer(keys, nmelfeatures, batchsize, time)
-   σ⁻¹stoprobs′ = Buffer(frame, batchsize, time)
+   prediction = Buffer(keys, nmelfeatures, batchsize, time_out)
+   σ⁻¹stoprobs′ = Buffer(frame, batchsize, time_out)
    # main autoregressive loop
-   for t ∈ 1:time
+   for t ∈ 1:time_out
       context, weights = m.attention(values, keys, query, weights, Σweights)
       Σweights += weights
       prenetoutput = m.prenet(frame)
       decoding = m.lstms([prenetoutput; context])
       decoding_context = [decoding; context]
       frame = m.frameproj(decoding_context)
-      σ⁻¹stoprobs′[:,t] = m.stopproj(decoding_context)
+      σ⁻¹pstop = m.stopproj(decoding_context)
+      σ⁻¹stoprobs′[:,t] = reshape(σ⁻¹pstop, Val(1))
       prediction[:,:,t] = frame
    end
    σ⁻¹stoprobs = copy(σ⁻¹stoprobs′)
@@ -276,25 +278,42 @@ function (m::Tacotron2)(textindices::DenseMatrix{<:Integer})
    return melprediction, melprediction⁺residual, σ⁻¹stoprobs
 end
 
-function loss(model::Tacotron2, textindices::DenseMatrix{<:Integer}, meltargets::DenseArray{<:Real,3})
-   melprediction, melprediction⁺residual, σ⁻¹stoprobs = model(textindices)
-   σ⁻¹stoptarget = gpu(zero(σ⁻¹stoprobs))
-   σ⁻¹stoptarget[:,end] .= 1.0f0
-   l = Flux.mse(melprediction, meltargets) +
-       Flux.mse(melprediction⁺residual, meltargets) +
-       mean(Flux.logitbinarycrossentropy.(σ⁻¹stoprobs, σ⁻¹stoptarget))
+
+function loss(model::Tacotron2, textindices::DenseMatrix{<:Integer}, meltarget::DenseArray{<:Real,3}, stoptarget::DenseMatrix{<:Real})
+   melprediction, melprediction⁺residual, σ⁻¹stoprobs = model(textindices, size(meltarget, 1))
+   l = mse(melprediction, meltarget) +
+       mse(melprediction⁺residual, meltarget) +
+       mean(logitbinarycrossentropy.(σ⁻¹stoprobs, stoptarget))
    return l
 end
 
-# TODO 3. add adjoint for hcat of 2 3D tensors and replace cat with hcat in the attentions forward pass
+loss(model::Tacotron2, (textindices, meltarget, stoptarget)::Tuple{DenseMatrix{<:Integer}, DenseArray{<:Real,3}, DenseMatrix{<:Real}}) = loss(model, textindices, meltarget, stoptarget)
 
+# TODO 3. add implement iterators to get rid of the Buffer code in the forward pass
+# TODO 4. add adjoint for hcat of 2 3D tensors and replace cat with hcat in the attentions forward pass
 
+grads = let
 datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
 metadatapath = joinpath(datadir, "metadata.csv")
 melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
 
-batchsize = 37
+batchsize = 11
 batches, alphabet = build_batches(metadatapath, melspectrogramspath, batchsize)
-textindices, targets = rand(batches)
+batch = batches[argmin(map(x -> size(last(x), 2), batches))]
+textindices, meltarget, stoptarget = batch
+
+loss(m, batch)
+
+
+
 
 m = Tacotron2(alphabet)
+
+θ = Flux.params(m)
+
+gs = gradient(θ) do
+   loss(m, textindices, meltarget, stoptarget)
+end
+
+return gs
+end

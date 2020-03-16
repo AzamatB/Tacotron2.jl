@@ -3,6 +3,7 @@ using DataFrames
 using FileIO
 using Base.Iterators
 using Random
+using Flux: onehotbatch
 
 function build_batches(metadatapath::AbstractString, melspectrogramspath::AbstractString, batchsize::Integer; eos='~', pad='_', kwargs...)
    dataset, alphabet = build_dataset(metadatapath, melspectrogramspath; eos=eos, pad=pad)
@@ -32,10 +33,11 @@ function pad_batch(batch::AbstractVector{<:Tuple{String,DenseMatrix{Float32}}}, 
    maxlength_x = 1 + (sorted ? (length∘first∘last)(batch) : maximum(length∘first, batch))
    reorder && shuffle!(batch)
 
-   melspectrogram_lengths = map(xy -> size(last(xy), 1), batch)
-   maxlength_y = maximum(melspectrogram_lengths)
+   mellengths = map(xy -> size(last(xy), 1), batch)
+   maxlength_y = maximum(mellengths)
    nchannels_y = size(last(first(batch)), 2)
 
+   stoptarget = Float32.(permutedims(onehotbatch(mellengths, 1:maxlength_y)))
    textindices = fill(padindex, maxlength_x, batchsize)
    melspectrograms = zeros(Float32, maxlength_y, nchannels_y, batchsize)
 
@@ -46,7 +48,7 @@ function pad_batch(batch::AbstractVector{<:Tuple{String,DenseMatrix{Float32}}}, 
       end
       textindices[length(text)+1,n] = eosindex
    end
-   return textindices, melspectrograms, melspectrogram_lengths
+   return textindices, melspectrograms, stoptarget
 end
 
 function build_dataset(metadatapath::AbstractString, melspectrogramspath::AbstractString; eos='~', pad='_')
