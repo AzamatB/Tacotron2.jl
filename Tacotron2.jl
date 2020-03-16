@@ -204,7 +204,8 @@ function Tacotron2(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_fe
    lstms = Chain(LSTM(dims.prenet + dims.encoding, dims.decoding), LSTM(dims.decoding, dims.decoding))
 
    frameproj = Dense(dims.decoding + dims.encoding, dims.melfeatures)
-   stopproj = Dense(dims.decoding + dims.encoding, 1, σ)
+   # will apply sigmoid implicitly during loss calculation with logitbinarycrossentropy for numerical stability
+   stopproj = Dense(dims.decoding + dims.encoding, 1 #=, σ =#)
 
    nchmel, nch, fs, pdrop = dims.melfeatures, dims.postnet, filtersizes.postnet, pdrops.postnet
    postnet = Chain([convblock(nchmel=>nch, tanh, fs, pdrop);
@@ -236,6 +237,11 @@ function Base.show(io::IO, m::Tacotron2)
                 )""")
 end
 
+function Flux.reset!(m::Tacotron2)
+   Flux.reset!(last(m.encoder))
+   Flux.reset!(m.lstms)
+end
+
 function (m::Tacotron2)(textindices::DenseMatrix{<:Integer})
    # dimensions
    time, batchsize = size(textindices)
@@ -251,7 +257,8 @@ function (m::Tacotron2)(textindices::DenseMatrix{<:Integer})
    Σweights = gpu(zeros(Float32, time, 1, batchsize))
    frame    = gpu(zeros(Float32, nmelfeatures, batchsize))
    # preallocate output buffer
-   prediction_buffer = Buffer(keys, nmelfeatures, batchsize, time)
+   prediction = Buffer(keys, nmelfeatures, batchsize, time)
+   σ⁻¹stoprobs′ = Buffer(frame, batchsize, time)
    # main autoregressive loop
    for t ∈ 1:time
       context, weights = m.attention(values, keys, query, weights, Σweights)
@@ -260,21 +267,26 @@ function (m::Tacotron2)(textindices::DenseMatrix{<:Integer})
       decoding = m.lstms([prenetoutput; context])
       decoding_context = [decoding; context]
       frame = m.frameproj(decoding_context)
-      pstop = m.stopproj(decoding_context)
-      # (pstop > 0.5f0) && break
-      prediction_buffer[:,:,t] = pstop .* frame
-      # @ein frame′[m,b] := frame[m,b] * pstop[u,b]; prediction_buffer[:,:,t] = frame′ # (vetted)
-      # prediction_buffer[:,:,t] = einsum(EinCode{((1, 2), (3, 2)), (1, 2)}(), (frame, pstop))
-      # #=check=# frame′ == reduce(hcat, [pstop[1,b] * frame[:,b] for b ∈ axes(frame,2)])
+      σ⁻¹stoprobs′[:,t] = m.stopproj(decoding_context)
+      prediction[:,:,t] = frame
    end
-   prediction = permutedims(copy(prediction_buffer), (3,1,2))
-   residue = m.postnet(prediction)
-   return prediction, residue
+   σ⁻¹stoprobs = copy(σ⁻¹stoprobs′)
+   melprediction = permutedims(copy(prediction), (3,1,2))
+   melprediction⁺residual = melprediction + m.postnet(melprediction)
+   return melprediction, melprediction⁺residual, σ⁻¹stoprobs
 end
 
+function loss(model::Tacotron2, textindices::DenseMatrix{<:Integer}, meltargets::DenseArray{<:Real,3})
+   melprediction, melprediction⁺residual, σ⁻¹stoprobs = model(textindices)
+   σ⁻¹stoptarget = gpu(zero(σ⁻¹stoprobs))
+   σ⁻¹stoptarget[:,end] .= 1.0f0
+   l = Flux.mse(melprediction, meltargets) +
+       Flux.mse(melprediction⁺residual, meltargets) +
+       mean(Flux.logitbinarycrossentropy.(σ⁻¹stoprobs, σ⁻¹stoptarget))
+   return l
+end
 
-
-
+# TODO 3. add adjoint for hcat of 2 3D tensors and replace cat with hcat in the attentions forward pass
 
 
 datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
