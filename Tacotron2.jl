@@ -2,7 +2,7 @@ using CuArrays
 using Flux
 using Flux: @functor, Recur, LSTMCell, dropout, mse, logitbinarycrossentropy
 using Zygote
-using Zygote: Buffer, @adjoint
+using Zygote: Buffer
 using OMEinsum
 using NamedTupleTools
 using Statistics
@@ -62,7 +62,8 @@ struct BLSTM{M <: DenseMatrix, V <: DenseVector}
    outdim   :: Int
 end
 
-@functor BLSTM (forward, backward)
+Flux.trainable(m::BLSTM) = (m.forward, m.backward)
+@functor BLSTM
 
 function BLSTM(in::Integer, out::Integer)
    forward  = LSTM(in, out)
@@ -108,16 +109,17 @@ end
 
 # Flux.reset!(m::BLSTM) = reset!((m.forward, m.backward)) # not needed as taken care of by @functor
 
-struct LocationAwareAttention{A <: DenseArray, M <: DenseMatrix, V <: DenseVector, D <: Dense}
+struct LocationAwareAttention{T <: DenseArray{<:Real,3}, M <: DenseMatrix, V <: DenseVector, D <: Dense}
    dense :: D # W & b
    pad   :: NTuple{2,Int}
-   F :: A
+   F :: T
    U :: M
    V :: M
    w :: V
 end
 
-@functor LocationAwareAttention (dense, F, U, V, w)
+Flux.trainable(m::LocationAwareAttention) = (m.dense, m.F, m.U, m.V, m.w)
+@functor LocationAwareAttention
 
 function LocationAwareAttention(encodingdim=512, location_featuredim=32, attentiondim=128, querydim=1024, filtersize=31)
    @assert isodd(filtersize)
@@ -137,25 +139,30 @@ function Base.show(io::IO, m::LocationAwareAttention)
 end
 
 function (m::LocationAwareAttention)(values::T, keys::T, query::DenseMatrix, lastweights::T, Σweights::T) where T <: DenseArray{<:Real,3}
-   rdims = size(Σweights)
-   time, _, batchsize = rdims
-   attentiondim = length(m.w)
    # weights_cat = [lastweights Σweights]
    # errors during gradient calculation; the workaround is to use cat instead of hcat:
-   weights_cat = cat(lastweights, Σweights; dims=2)
+   weights_cat = cat(lastweights, Σweights; dims=2)::T
    cdims = DenseConvDims(weights_cat, m.F; padding=m.pad)
+   return m(values, keys, query, weights_cat, cdims)
+end
+function (m::LocationAwareAttention)(values::T, keys::T, query::M, weights_cat::T, cdims::DenseConvDims) where {M <: DenseMatrix, T <: DenseArray{<:Real,3}}
    # location features
    fs = conv(weights_cat, m.F, cdims) # F✶weights_cat
-   @ein Uf[a,t,b] := m.U[a,c] * fs[t,c,b] # dispatches to batched_contract (vetted)
+   # @ein Uf[a,t,b] := m.U[a,c] * fs[t,c,b] # dispatches to batched_contract (vetted)
+   Uf = einsum(EinCode{((1,2), (3,2,4)), (1,3,4)}(), (m.U, fs))::T
    # #=check=# Uf ≈ reduce(hcat, [reshape(m.U * fs[t,:,:], size(m.U,1), 1, :) for t ∈ axes(fs,1)])
+   time, _, batchsize = size(weights_cat)
+   attentiondim = length(m.w)
    Ws⁺b = reshape(m.dense(query), attentiondim, 1, batchsize) # (a -> b) & (t -> c -> b)
    tanhWs⁺Vh⁺Uf⁺b = tanh.(Ws⁺b .+ keys .+ Uf)
-   @ein energies[t,b] := m.w[a] * tanhWs⁺Vh⁺Uf⁺b[a,t,b] # dispatches to batched_contract (vetted)
+   # @ein energies[t,b] := m.w[a] * tanhWs⁺Vh⁺Uf⁺b[a,t,b] # dispatches to batched_contract (vetted)
+   energies = einsum(EinCode{((1,), (1,2,3)), (2,3)}(), (m.w, tanhWs⁺Vh⁺Uf⁺b))::M
    # #=check=# energies == reduce(vcat, [m.w'tanhWs⁺Vh⁺Uf⁺b[:,t,:] for t ∈ axes(tanhWs⁺Vh⁺Uf⁺b,2)])
    weights = softmax(energies) # α
-   @ein context[d,b] := values[d,t,b] * weights[t,b] # dispatches to batched_contract (vetted)
+   # @ein context[d,b] := values[d,t,b] * weights[t,b] # dispatches to batched_contract (vetted)
+   context = einsum(EinCode{((1,2,3), (2,3)), (1,3)}(), (values, weights))::M
    # #=check=# context ≈ reduce(hcat, [sum(weights[t,b] * values[:,t,b] for t ∈ axes(values,2)) for b ∈ axes(values,3)])
-   return context, reshape(weights, rdims)
+   return context, reshape(weights, (time, 1, batchsize))
 end
 
 struct PreNet{D<:Dense}
@@ -164,7 +171,8 @@ struct PreNet{D<:Dense}
    pdrop  :: Float32
 end
 
-@functor PreNet (dense₁, dense₂)
+Flux.trainable(m::PreNet) = (m.dense₁, m.dense₂)
+@functor PreNet
 
 function PreNet(in::Integer, out::Integer=256, pdrop=0.5f0, σ=leakyrelu)
    @assert 0 < pdrop < 1
@@ -181,14 +189,16 @@ end
 # "In order to introduce output variation at inference time, dropout with probability 0.5 is applied only to layers in the pre-net of the autoregressive decoder"
 (m::PreNet)(x::DenseVecOrMat) = dropout(m.dense₂(dropout(m.dense₁(x), m.pdrop)), m.pdrop)
 
-struct Tacotron2{E <: Chain, A <: LocationAwareAttention, P <: PreNet, L <: Chain, D₁ <: Dense, D₂ <: Dense, C <: Chain}
-   encoder   :: E
-   attention :: A
-   prenet    :: P
-   lstms     :: L
-   frameproj :: D₁
-   stopproj  :: D₂
-   postnet   :: C
+struct Tacotron2{E <: CharEmbedding, C₃ <: Chain, B <: BLSTM, A <: LocationAwareAttention, P <: PreNet, L <: Chain, D₁ <: Dense, D₂ <: Dense, C₅ <: Chain}
+   che        :: E
+   convblock₃ :: C₃
+   blstm      :: B
+   attention  :: A
+   prenet     :: P
+   lstms      :: L
+   frameproj  :: D₁
+   stopproj   :: D₂
+   postnet    :: C₅
 end
 
 @functor Tacotron2
@@ -201,7 +211,6 @@ function Tacotron2(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_fe
    che = CharEmbedding(dims.alphabet, dims.encoding)
    convblock₃ = Chain(reduce(vcat, map(_ -> convblock(dims.encoding=>dims.encoding, leakyrelu, filtersizes.encoding, pdrops.encoding), 1:3))...) |> gpu
    blstm = BLSTM(dims.encoding, dims.encoding÷2)
-   encoder = Chain(che, convblock₃.layers..., blstm)
 
    attention = LocationAwareAttention(dims.encoding, dims.location_feature, dims.attention, dims.query, filtersizes.attention)
    prenet = PreNet(dims.melfeatures, dims.prenet, pdrops.prenet)
@@ -217,7 +226,7 @@ function Tacotron2(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_fe
                     convblock(nch=>nch, tanh, fs, pdrop);
                     convblock(nch=>nch, tanh, fs, pdrop);
                     convblock(nch=>nchmel, identity, fs, pdrop)]...)
-   Tacotron2(encoder, attention, prenet, lstms, frameproj, stopproj, postnet)
+   Tacotron2(che, convblock₃, blstm, attention, prenet, lstms, frameproj, stopproj, postnet)
 end
 
 function Tacotron2(alphabet,
@@ -231,7 +240,9 @@ end
 
 function Base.show(io::IO, m::Tacotron2)
    print(io, """Tacotron2(
-                   $(m.encoder),
+                   $(m.che),
+                   $(m.convblock₃),
+                   $(m.blstm),
                    $(m.attention),
                    $(m.prenet),
                    $(m.lstms),
@@ -242,7 +253,7 @@ function Base.show(io::IO, m::Tacotron2)
 end
 
 function Flux.reset!(m::Tacotron2)
-   Flux.reset!(last(m.encoder))
+   Flux.reset!(m.blstm)
    Flux.reset!(m.lstms)
 end
 
@@ -251,24 +262,32 @@ function (m::Tacotron2)(textindices::DenseMatrix{<:Integer}, time_out::Integer)
    time_in, batchsize = size(textindices)
    querydim = size(m.attention.dense.W, 2)
    nmelfeatures = length(m.frameproj.b)
-   # encoding
-   values = m.encoder(textindices)
-   @ein keys[a,t,b] := m.attention.V[a,d] * values[d,t,b] # dispatches to batched_contract (vetted)
-   # #=check=# Vh ≈ reduce(hcat, [reshape(m.V * values[:,t,:], size(m.V,1), 1, :) for t ∈ axes(values,2)])
    # initialize parameters
-   query    = gpu(zeros(Float32, querydim, batchsize))
-   weights  = gpu(zeros(Float32, time_in, 1, batchsize))
-   Σweights = gpu(zeros(Float32, time_in, 1, batchsize))
-   frame    = gpu(zeros(Float32, nmelfeatures, batchsize))
+   query₀    = gpu(zeros(Float32, querydim, batchsize))
+   weights₀  = gpu(zeros(Float32, time_in, 1, batchsize))
+   Σweights₀ = weights₀
+   frame₀    = gpu(zeros(Float32, nmelfeatures, batchsize))
+   return m(textindices, time_out, query₀, weights₀, Σweights₀, frame₀)
+end
+
+function (m::Tacotron2)(textindices::DenseMatrix{<:Integer}, time_out::Integer, query::M, weights::T₃, Σweights::T₃, frame::M) where {M <: DenseMatrix, T₃ <: DenseArray{<:Real,3}}
+   # encoding stage
+   chex = m.che(textindices)
+   convblock₃x = m.convblock₃(chex)::T₃
+   values = m.blstm(convblock₃x)
+   # @ein keys[a,t,b] := m.attention.V[a,d] * values[d,t,b] # dispatches to batched_contract (vetted)
+   keys = einsum(EinCode{((1,2), (2,3,4)), (1,3,4)}(), (m.attention.V, values))::T₃
+   # #=check=# Vh ≈ reduce(hcat, [reshape(m.V * values[:,t,:], size(m.V,1), 1, :) for t ∈ axes(values,2)])
    # preallocate output buffer
+   nmelfeatures, batchsize = size(frame)
    prediction = Buffer(keys, nmelfeatures, batchsize, time_out)
    σ⁻¹stoprobs′ = Buffer(frame, batchsize, time_out)
    # main autoregressive loop
    for t ∈ 1:time_out
-      context, weights = m.attention(values, keys, query, weights, Σweights)
+      context, weights = m.attention(values, keys, query, weights, Σweights)::Tuple{M,T₃}
       Σweights += weights
       prenetoutput = m.prenet(frame)
-      query = m.lstms([prenetoutput; context])
+      query = m.lstms([prenetoutput; context])::M
       query_context = [query; context]
       frame = m.frameproj(query_context)
       σ⁻¹pstopᵀ = m.stopproj(query_context)
@@ -277,7 +296,7 @@ function (m::Tacotron2)(textindices::DenseMatrix{<:Integer}, time_out::Integer)
    end
    σ⁻¹stoprobs = copy(σ⁻¹stoprobs′)
    melprediction = permutedims(copy(prediction), (3,1,2))
-   melprediction⁺residual = melprediction + m.postnet(melprediction)
+   melprediction⁺residual = melprediction + m.postnet(melprediction)::T₃
    return melprediction, melprediction⁺residual, σ⁻¹stoprobs
 end
 
@@ -305,17 +324,22 @@ batch = batches[argmin(map(x -> size(last(x), 2), batches))]
 textindices, meltarget, stoptarget = batch
 time_out = size(stoptarget, 2)
 
-loss(m, batch)
+
 
 
 
 m = Tacotron2(alphabet)
 
+loss(m, batch)
+
 θ = Flux.params(m)
 
-gs = gradient(θ) do
-   loss(m, textindices, meltarget, stoptarget)
+gradient(θ) do
+   loss(m, batch)
 end
 
-return gs
+Juno.@profiler let θ = θ, m = m, batch = batch
+   gradient(θ) do
+      loss(m, batch)
+   end
 end

@@ -1,7 +1,12 @@
+using Zygote: @adjoint
+
 vectorof(::Type{<:Array{T}}) where T = Vector{T}
 matrixof(::Type{<:Array{T}}) where T = Matrix{T}
+tensor₃of(::Type{<:Array{T}}) where T = Array{T,3}
+
 vectorof(::Type{<:CuArray{T}}) where T = CuVector{T,Nothing}
 matrixof(::Type{<:CuArray{T}}) where T = CuMatrix{T,Nothing}
+tensor₃of(::Type{<:CuArray{T}}) where T = CuArray{T,3,Nothing}
 
 function Flux.dropout(x, p)
    q = 1 - p
