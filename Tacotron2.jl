@@ -139,9 +139,8 @@ function Base.show(io::IO, m::LocationAwareAttention)
 end
 
 function (m::LocationAwareAttention)(values::T, keys::T, query::DenseMatrix, lastweights::T, Σweights::T) where T <: DenseArray{<:Real,3}
-   # weights_cat = [lastweights Σweights]
-   # errors during gradient calculation; the workaround is to use cat instead of hcat:
-   weights_cat = cat(lastweights, Σweights; dims=2)::T
+   # weights_cat = cat(lastweights, Σweights; dims=2)::T
+   weights_cat = [lastweights Σweights]::T
    cdims = DenseConvDims(weights_cat, m.F; padding=m.pad)
    return m(values, keys, query, weights_cat, cdims)
 end
@@ -189,7 +188,7 @@ end
 # "In order to introduce output variation at inference time, dropout with probability 0.5 is applied only to layers in the pre-net of the autoregressive decoder"
 (m::PreNet)(x::DenseVecOrMat) = dropout(m.dense₂(dropout(m.dense₁(x), m.pdrop)), m.pdrop)
 
-struct Tacotron2{E <: CharEmbedding, C₃ <: Chain, B <: BLSTM, A <: LocationAwareAttention, P <: PreNet, L <: Chain, D₁ <: Dense, D₂ <: Dense, C₅ <: Chain}
+struct Tacotron₂{E <: CharEmbedding, C₃ <: Chain, B <: BLSTM, A <: LocationAwareAttention, P <: PreNet, L <: Chain, D₁ <: Dense, D₂ <: Dense, C₅ <: Chain}
    che        :: E
    convblock₃ :: C₃
    blstm      :: B
@@ -201,9 +200,9 @@ struct Tacotron2{E <: CharEmbedding, C₃ <: Chain, B <: BLSTM, A <: LocationAwa
    postnet    :: C₅
 end
 
-@functor Tacotron2
+@functor Tacotron₂
 
-function Tacotron2(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_feature,:prenet,:query,:melfeatures,:postnet), <:NTuple{8,Integer}},
+function Tacotron₂(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_feature,:prenet,:query,:melfeatures,:postnet), <:NTuple{8,Integer}},
    filtersizes::NamedTuple{(:encoding,:attention,:postnet),<:NTuple{3,Integer}},
    pdrops::NamedTuple{(:encoding,:prenet,:postnet),<:NTuple{3,AbstractFloat}})
    @assert iseven(dims.encoding)
@@ -226,20 +225,20 @@ function Tacotron2(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_fe
                     convblock(nch=>nch, tanh, fs, pdrop);
                     convblock(nch=>nch, tanh, fs, pdrop);
                     convblock(nch=>nchmel, identity, fs, pdrop)]...)
-   Tacotron2(che, convblock₃, blstm, attention, prenet, lstms, frameproj, stopproj, postnet)
+   Tacotron₂(che, convblock₃, blstm, attention, prenet, lstms, frameproj, stopproj, postnet)
 end
 
-function Tacotron2(alphabet,
+function Tacotron₂(alphabet,
    otherdims=(encoding=512, attention=128, location_feature=32, prenet=256, query=1024, melfeatures=80, postnet=512),
    filtersizes = (encoding=5, attention=31, postnet=5),
    pdrop=0.5f0)
    dims = merge((alphabet = length(alphabet),), otherdims)
    pdrops = (encoding=pdrop, prenet=pdrop, postnet=pdrop)
-   Tacotron2(dims, filtersizes, pdrops)
+   Tacotron₂(dims, filtersizes, pdrops)
 end
 
-function Base.show(io::IO, m::Tacotron2)
-   print(io, """Tacotron2(
+function Base.show(io::IO, m::Tacotron₂)
+   print(io, """Tacotron₂(
                    $(m.che),
                    $(m.convblock₃),
                    $(m.blstm),
@@ -252,12 +251,12 @@ function Base.show(io::IO, m::Tacotron2)
                 )""")
 end
 
-function Flux.reset!(m::Tacotron2)
+function Flux.reset!(m::Tacotron₂)
    Flux.reset!(m.blstm)
    Flux.reset!(m.lstms)
 end
 
-function (m::Tacotron2)(textindices::DenseMatrix{<:Integer}, time_out::Integer)
+function (m::Tacotron₂)(textindices::DenseMatrix{<:Integer}, time_out::Integer)
    # dimensions
    time_in, batchsize = size(textindices)
    querydim = size(m.attention.dense.W, 2)
@@ -270,7 +269,7 @@ function (m::Tacotron2)(textindices::DenseMatrix{<:Integer}, time_out::Integer)
    return m(textindices, time_out, query₀, weights₀, Σweights₀, frame₀)
 end
 
-function (m::Tacotron2)(textindices::DenseMatrix{<:Integer}, time_out::Integer, query::M, weights::T₃, Σweights::T₃, frame::M) where {M <: DenseMatrix, T₃ <: DenseArray{<:Real,3}}
+function (m::Tacotron₂)(textindices::DenseMatrix{<:Integer}, time_out::Integer, query::M, weights::T₃, Σweights::T₃, frame::M) where {M <: DenseMatrix, T₃ <: DenseArray{<:Real,3}}
    # encoding stage
    chex = m.che(textindices)
    convblock₃x = m.convblock₃(chex)::T₃
@@ -287,7 +286,8 @@ function (m::Tacotron2)(textindices::DenseMatrix{<:Integer}, time_out::Integer, 
       context, weights = m.attention(values, keys, query, weights, Σweights)::Tuple{M,T₃}
       Σweights += weights
       prenetoutput = m.prenet(frame)
-      query = m.lstms([prenetoutput; context])::M
+      prenetoutput_context = [prenetoutput; context]
+      query = m.lstms(prenetoutput_context)::M
       query_context = [query; context]
       frame = m.frameproj(query_context)
       σ⁻¹pstopᵀ = m.stopproj(query_context)
@@ -300,7 +300,7 @@ function (m::Tacotron2)(textindices::DenseMatrix{<:Integer}, time_out::Integer, 
    return melprediction, melprediction⁺residual, σ⁻¹stoprobs
 end
 
-function loss(model::Tacotron2, textindices::DenseMatrix{<:Integer}, meltarget::DenseArray{<:Real,3}, stoptarget::DenseMatrix{<:Real})
+function loss(model::Tacotron₂, textindices::DenseMatrix{<:Integer}, meltarget::DenseArray{<:Real,3}, stoptarget::DenseMatrix{<:Real})
    melprediction, melprediction⁺residual, σ⁻¹stoprobs = model(textindices, size(meltarget, 1))
    l = mse(melprediction, meltarget) +
        mse(melprediction⁺residual, meltarget) +
@@ -308,12 +308,11 @@ function loss(model::Tacotron2, textindices::DenseMatrix{<:Integer}, meltarget::
    return l
 end
 
-loss(model::Tacotron2, (textindices, meltarget, stoptarget)::Tuple{DenseMatrix{<:Integer}, DenseArray{<:Real,3}, DenseMatrix{<:Real}}) = loss(model, textindices, meltarget, stoptarget)
+loss(model::Tacotron₂, (textindices, meltarget, stoptarget)::Tuple{DenseMatrix{<:Integer}, DenseArray{<:Real,3}, DenseMatrix{<:Real}}) = loss(model, textindices, meltarget, stoptarget)
 
 # TODO 3. add implement iterators to get rid of the Buffer code in the forward pass
 # TODO 4. add adjoint for hcat of 2 3D tensors and replace cat with hcat in the attentions forward pass
 
-gs = let
 datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
 metadatapath = joinpath(datadir, "metadata.csv")
 melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
@@ -321,25 +320,21 @@ melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
 batchsize = 11
 batches, alphabet = build_batches(metadatapath, melspectrogramspath, batchsize)
 batch = batches[argmin(map(x -> size(last(x), 2), batches))]
+
 textindices, meltarget, stoptarget = batch
 time_out = size(stoptarget, 2)
 
 
+m = Tacotron₂(alphabet)
 
-
-
-m = Tacotron2(alphabet)
-
-loss(m, batch)
+@time loss(m, batch)
 
 θ = Flux.params(m)
 
-gradient(θ) do
+@time gs = gradient(θ) do
    loss(m, batch)
 end
 
-Juno.@profiler let θ = θ, m = m, batch = batch
-   gradient(θ) do
-      loss(m, batch)
-   end
+Juno.@profiler gradient(θ) do
+   loss(m, batch)
 end

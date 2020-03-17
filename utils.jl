@@ -31,3 +31,30 @@ end
    cumsizes = cumsum(size.(As, 1))
    return reduce(vcat, As), Δ -> (nothing, map((sz, A) -> Zygote.pull_block_vert(sz, Δ, A), cumsizes, As))
 end
+
+veclength(::Tuple) = 1
+veclength(x::AbstractVector{<:Tuple}) = length(x)
+pull_block_vert(idx, ȳ, x::Tuple) = ȳ[idx]
+pull_block_vert(lastidx, ȳ, x::AbstractVector{<:Tuple}) = ȳ[(lastidx-length(x)+1):lastidx]
+
+@adjoint function vcat(xs::Union{AbstractVector{T},T}...) where T <: Tuple
+   lastidx = Ref(0)
+   lastidxs = ntuple(length(xs)) do i
+      @inbounds lastidx[] += veclength(xs[i])
+   end
+   return vcat(xs...), function (ȳ)
+      (map((lastidx, x) -> pull_block_vert(lastidx, ȳ, x), lastidxs, xs)...,)
+   end
+end
+
+pull_block_horz(lastidx, ȳ, x::AbstractArray{<:Number,3}) = ȳ[:, (lastidx-size(x,2)+1):lastidx, :]
+
+@adjoint function hcat(xs::T₃...) where T₃ <: AbstractArray{<:Number,3}
+   lastidx = Ref(0)
+   lastidxs = ntuple(length(xs)) do i
+      @inbounds lastidx[] += size(xs[i], 2)
+   end
+   return hcat(xs...), function (ȳ)
+      (map((lastidx, x) -> pull_block_horz(lastidx, ȳ, x), lastidxs, xs)...,)
+   end
+end

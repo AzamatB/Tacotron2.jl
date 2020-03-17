@@ -1,38 +1,54 @@
-struct Decodings{T <: DenseArray{<:Real,3}, M <: Tacotron2}
+struct Decodings{T, M}
    m :: M
-   values :: T
-   keys   :: T
-   batchsize    :: Int
-   querydim     :: Int
-   nmelfeatures :: Int
-   time_in      :: Int
-   time_out     :: Int
+   values   :: T
+   keys     :: T
+   time_out :: Int
 end
+
+@adjoint function Decodings(m::Tacotron2, values::T, keys::T, time_out::Int) where T <: DenseArray{<:Real,3}
+   return Decodings(m, values, keys, time_out), function (d̄)
+      return d̄.m, d̄.values, d̄.keys, nothing
+   end
+end
+
+# ȳ = collect(Decodings(m, values, keys, time_out))
+# Decodings(first(ȳ)[3:end]..., length(ȳ))
+
+@adjoint function collect(x::Decodings)
+   collect(x), function(ȳ)
+      return (Decodings(first(ȳ)[3:end]..., length(ȳ)),)
+   end
+end
+
 
 Flux.trainable(d::Decodings) = (d.m,)
 @functor Decodings
 
-Base.eltype(::Type{<:Decodings{T}}) where T <: DenseArray{<:Real,3} = Tuple{matrixof(T), vectorof(T)}
+Base.eltype(::Type{<:Decodings{T,M}}) where {T <: DenseArray{<:Real,3}, M <: Tacotron2} = Tuple{matrixof(T), vectorof(T), M, T, T}
 Base.length(itr::Decodings) = itr.time_out
 
 function Base.iterate(itr::Decodings)
     (itr.time_out <= 0) && (return nothing)
-    batchsize, time_in = itr.batchsize, itr.time_in
+    #initialize dimensions
+    _, time_in, batchsize = size(itr.values)
+    querydim = size(m.attention.dense.W, 2)
+    nmelfeatures = length(m.frameproj.b)
     # initialize parameters
-    query    = gpu(zeros(Float32, itr.querydim, batchsize))
+    query    = gpu(zeros(Float32, querydim, batchsize))
     weights  = gpu(zeros(Float32, time_in, 1, batchsize))
     Σweights = weights
-    frame    = gpu(zeros(Float32, itr.nmelfeatures, batchsize))
+    frame    = gpu(zeros(Float32, nmelfeatures, batchsize))
 
     context, weights = itr.m.attention(itr.values, itr.keys, query, weights, Σweights)
     Σweights = weights
     prenetoutput = itr.m.prenet(frame)
-    query = itr.m.lstms([prenetoutput; context])
+    prenetoutput_context = [prenetoutput; context]
+    query = itr.m.lstms(prenetoutput_context)
     query_context = [query; context]
     frame = itr.m.frameproj(query_context)
     σ⁻¹pstopᵀ = itr.m.stopproj(query_context)
     σ⁻¹pstop = reshape(σ⁻¹pstopᵀ, Val(1))
-    i = (frame, σ⁻¹pstop)
+    i = (frame, σ⁻¹pstop, m, values, keys)
     state = (1, query, weights, Σweights, frame)
     return i, state
 end
@@ -44,29 +60,35 @@ function Base.iterate(itr::Decodings, state::Tuple{Int,M,T,T,M}) where {M <: Den
     context, weights = itr.m.attention(itr.values, itr.keys, query, weights, Σweights)
     Σweights += weights
     prenetoutput = itr.m.prenet(frame)
-    query = itr.m.lstms([prenetoutput; context])
+    prenetoutput_context = [prenetoutput; context]
+    query = itr.m.lstms(prenetoutput_context)
     query_context = [query; context]
     frame = itr.m.frameproj(query_context)
     σ⁻¹pstopᵀ = itr.m.stopproj(query_context)
     σ⁻¹pstop = reshape(σ⁻¹pstopᵀ, Val(1))
-    i = (frame, σ⁻¹pstop)
+    i = (frame, σ⁻¹pstop, m, values, keys)
     state = (t, query, weights, Σweights, frame)
     return i, state
 end
 
 function (m::Tacotron2)(textindices::DenseMatrix{<:Integer}, time_out::Integer)
    # dimensions
-   time_in, batchsize = size(textindices)
-   querydim = size(m.attention.dense.W, 2)
+   batchsize = size(textindices, 2)
    nmelfeatures = length(m.frameproj.b)
-   # encodings
-   values = m.encoder(textindices)
-   @ein keys[a,t,b] := m.attention.V[a,d] * values[d,t,b] # dispatches to batched_contract (vetted)
+   # encoding stage
+   chex = m.che(textindices)
+   convblock₃x = m.convblock₃(chex)
+   values = m.blstm(convblock₃x)
+   # @ein keys[a,t,b] := m.attention.V[a,d] * values[d,t,b] # dispatches to batched_contract (vetted)
+   keys = einsum(EinCode{((1,2), (2,3,4)), (1,3,4)}(), (m.attention.V, values))
    # #=check=# Vh ≈ reduce(hcat, [reshape(m.V * values[:,t,:], size(m.V,1), 1, :) for t ∈ axes(values,2)])
-   decodings′ = Decodings(m, values, keys, batchsize, querydim, nmelfeatures, time_in, time_out)
-   decodings = [decoding for decoding ∈ decodings′]
+   # decodings′ = Zygote.bufferfrom(Vector{Tuple{Matrix{Float32},Vector{Float32}}}(undef, time_out))
+   # decodings′ .= Decodings(m, values, keys, time_out)
+   # decodings = copy(decodings′)
+   # decodings = [decoding for decoding ∈ decodings′]
+   decodings = collect(Decodings(m, values, keys, time_out))
    frames = first.(decodings)
-   σ⁻¹pstops = last.(decodings)
+   σ⁻¹pstops = getindex.(decodings, 2)
    σ⁻¹stoprobs = reduce(hcat, σ⁻¹pstops)
    prediction = reshape(reduce(hcat, frames), nmelfeatures, batchsize, time_out)
    # #=check=# prediction == cat(frames...; dims=3)
