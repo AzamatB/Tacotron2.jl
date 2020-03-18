@@ -1,3 +1,4 @@
+# Warning: adjoint of the `collect(x::Decodings)` defined below is likely wrong
 struct Decodings{T, M}
    m :: M
    values   :: T
@@ -11,15 +12,12 @@ end
    end
 end
 
-# ȳ = collect(Decodings(m, values, keys, time_out))
-# Decodings(first(ȳ)[3:end]..., length(ȳ))
-
+# this adjoint is seems wrong
 @adjoint function collect(x::Decodings)
    collect(x), function(ȳ)
       return (Decodings(first(ȳ)[3:end]..., length(ȳ)),)
    end
 end
-
 
 Flux.trainable(d::Decodings) = (d.m,)
 @functor Decodings
@@ -28,49 +26,48 @@ Base.eltype(::Type{<:Decodings{T,M}}) where {T <: DenseArray{<:Real,3}, M <: Tac
 Base.length(itr::Decodings) = itr.time_out
 
 function Base.iterate(itr::Decodings)
-    (itr.time_out <= 0) && (return nothing)
-    #initialize dimensions
-    _, time_in, batchsize = size(itr.values)
-    querydim = size(m.attention.dense.W, 2)
-    nmelfeatures = length(m.frameproj.b)
-    # initialize parameters
-    query    = gpu(zeros(Float32, querydim, batchsize))
-    weights  = gpu(zeros(Float32, time_in, 1, batchsize))
-    Σweights = weights
-    frame    = gpu(zeros(Float32, nmelfeatures, batchsize))
+   (itr.time_out <= 0) && (return nothing)
+   #initialize dimensions
+   _, time_in, batchsize = size(itr.values)
+   querydim = size(m.attention.dense.W, 2)
+   nmelfeatures = length(m.frameproj.b)
+   # initialize parameters
+   query   = gpu(zeros(Float32, querydim, batchsize))
+   weights = gpu(zeros(Float32, time_in, 1, batchsize))
+   frame   = gpu(zeros(Float32, nmelfeatures, batchsize))
 
-    context, weights = itr.m.attention(itr.values, itr.keys, query, weights, Σweights)
-    Σweights = weights
-    prenetoutput = itr.m.prenet(frame)
-    prenetoutput_context = [prenetoutput; context]
-    query = itr.m.lstms(prenetoutput_context)
-    query_context = [query; context]
-    frame = itr.m.frameproj(query_context)
-    σ⁻¹pstopᵀ = itr.m.stopproj(query_context)
-    σ⁻¹pstop = reshape(σ⁻¹pstopᵀ, Val(1))
-    i = (frame, σ⁻¹pstop, m, values, keys)
-    state = (1, query, weights, Σweights, frame)
-    return i, state
+   context, weights = itr.m.attention(itr.values, itr.keys, query, weights, weights)
+   prenetoutput = itr.m.prenet(frame)
+   prenetoutput_context = [prenetoutput; context]
+   query = itr.m.lstms(prenetoutput_context)
+   query_context = [query; context]
+   frame = itr.m.frameproj(query_context)
+   σ⁻¹pstopᵀ = itr.m.stopproj(query_context)
+   σ⁻¹pstop = reshape(σ⁻¹pstopᵀ, Val(1))
+   i = (frame, σ⁻¹pstop, m, values, keys)
+   state = (1, query, weights, weights, frame)
+   return i, state
 end
 
 function Base.iterate(itr::Decodings, state::Tuple{Int,M,T,T,M}) where {M <: DenseMatrix, T <: DenseArray{<:Real,3}}
-    (t, query, weights, Σweights, frame) = state
-    (t == itr.time_out) && (return nothing)
-    t += 1
-    context, weights = itr.m.attention(itr.values, itr.keys, query, weights, Σweights)
-    Σweights += weights
-    prenetoutput = itr.m.prenet(frame)
-    prenetoutput_context = [prenetoutput; context]
-    query = itr.m.lstms(prenetoutput_context)
-    query_context = [query; context]
-    frame = itr.m.frameproj(query_context)
-    σ⁻¹pstopᵀ = itr.m.stopproj(query_context)
-    σ⁻¹pstop = reshape(σ⁻¹pstopᵀ, Val(1))
-    i = (frame, σ⁻¹pstop, m, values, keys)
-    state = (t, query, weights, Σweights, frame)
-    return i, state
+   (t, query, weights, Σweights, frame) = state
+   (t == itr.time_out) && (return nothing)
+   t += 1
+   context, weights = itr.m.attention(itr.values, itr.keys, query, weights, Σweights)
+   Σweights += weights
+   prenetoutput = itr.m.prenet(frame)
+   prenetoutput_context = [prenetoutput; context]
+   query = itr.m.lstms(prenetoutput_context)
+   query_context = [query; context]
+   frame = itr.m.frameproj(query_context)
+   σ⁻¹pstopᵀ = itr.m.stopproj(query_context)
+   σ⁻¹pstop = reshape(σ⁻¹pstopᵀ, Val(1))
+   i = (frame, σ⁻¹pstop, m, values, keys)
+   state = (t, query, weights, Σweights, frame)
+   return i, state
 end
 
+###
 function (m::Tacotron2)(textindices::DenseMatrix{<:Integer}, time_out::Integer)
    # dimensions
    batchsize = size(textindices, 2)

@@ -12,6 +12,7 @@ CuArrays.allowscalar(false)
 include("utils.jl")
 include("dataprepLJSpeech/dataprep.jl")
 
+###
 struct CharEmbedding{M <: DenseMatrix}
    embedding :: M
 end
@@ -51,6 +52,7 @@ function convblock(nchannels::Pair{<:Integer,<:Integer} = (512=>512),
     Dropout(pdrop)] |> gpu
 end
 
+###
 """
     BLSTM(in::Integer, out::Integer)
 
@@ -109,6 +111,7 @@ end
 
 # Flux.reset!(m::BLSTM) = reset!((m.forward, m.backward)) # not needed as taken care of by @functor
 
+###
 struct LocationAwareAttention{T <: DenseArray{<:Real,3}, M <: DenseMatrix, V <: DenseVector, D <: Dense}
    dense :: D # W & b
    pad   :: NTuple{2,Int}
@@ -164,6 +167,7 @@ function (m::LocationAwareAttention)(values::T, keys::T, query::M, weights_cat::
    return context, reshape(weights, (time, 1, batchsize))
 end
 
+###
 struct PreNet{D<:Dense}
    dense₁ :: D
    dense₂ :: D
@@ -188,6 +192,7 @@ end
 # "In order to introduce output variation at inference time, dropout with probability 0.5 is applied only to layers in the pre-net of the autoregressive decoder"
 (m::PreNet)(x::DenseVecOrMat) = dropout(m.dense₂(dropout(m.dense₁(x), m.pdrop)), m.pdrop)
 
+###
 struct Tacotron₂{E <: CharEmbedding, C₃ <: Chain, B <: BLSTM, A <: LocationAwareAttention, P <: PreNet, L <: Chain, D₁ <: Dense, D₂ <: Dense, C₅ <: Chain}
    che        :: E
    convblock₃ :: C₃
@@ -300,6 +305,7 @@ function (m::Tacotron₂)(textindices::DenseMatrix{<:Integer}, time_out::Integer
    return melprediction, melprediction⁺residual, σ⁻¹stoprobs
 end
 
+###
 function loss(model::Tacotron₂, textindices::DenseMatrix{<:Integer}, meltarget::DenseArray{<:Real,3}, stoptarget::DenseMatrix{<:Real})
    melprediction, melprediction⁺residual, σ⁻¹stoprobs = model(textindices, size(meltarget, 1))
    l = mse(melprediction, meltarget) +
@@ -310,8 +316,7 @@ end
 
 loss(model::Tacotron₂, (textindices, meltarget, stoptarget)::Tuple{DenseMatrix{<:Integer}, DenseArray{<:Real,3}, DenseMatrix{<:Real}}) = loss(model, textindices, meltarget, stoptarget)
 
-# TODO 3. add implement iterators to get rid of the Buffer code in the forward pass
-# TODO 4. add adjoint for hcat of 2 3D tensors and replace cat with hcat in the attentions forward pass
+###
 
 datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
 metadatapath = joinpath(datadir, "metadata.csv")
