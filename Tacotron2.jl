@@ -193,15 +193,91 @@ end
 (m::PreNet)(x::DenseVecOrMat) = dropout(m.dense₂(dropout(m.dense₁(x), m.pdrop)), m.pdrop)
 
 ###
-struct Tacotron₂{E <: CharEmbedding, C₃ <: Chain, B <: BLSTM, A <: LocationAwareAttention, P <: PreNet, L <: Chain, D₁ <: Dense, D₂ <: Dense, C₅ <: Chain}
-   che        :: E
+mutable struct State{M <: DenseMatrix, T₃ <: DenseArray{<:Real,3}}
+   h::Tuple{NTuple{2,M}, NTuple{2,M}, M, T₃, T₃, M}
+end
+
+trainable(m::State) = ()
+
+@functor State
+
+struct Decoder{V <: DenseVector, M <: DenseMatrix, T₃ <: DenseArray{<:Real,3}, D <: Dense}
+   attention  :: LocationAwareAttention{T₃, M, V}
+   prenet     :: PreNet{D}
+   lstmcells  :: NTuple{2,LSTMCell{M,V}}
+   frameproj  :: Dense{typeof(identity), M, V}
+   lstmstate₀ :: NTuple{2, NTuple{2,M}}
+   state      :: State{M, T₃}
+end
+
+trainable(m::Decoder) = (m.attention, m.prenet, m.lstmcells, m.frameproj, m.lstmstate₀)
+
+@functor Decoder
+
+function Decoder(dims, filtersizes, pdrops)
+   attention = LocationAwareAttention(dims.encoding, dims.location_feature, dims.attention, dims.query, filtersizes.attention) |> gpu
+   prenet = PreNet(dims.melfeatures, dims.prenet, pdrops.prenet)
+   lstmcells = (LSTMCell(dims.prenet + dims.encoding, dims.query), LSTMCell(dims.query, dims.query)) |> gpu
+   frameproj = Dense(dims.query + dims.encoding, dims.melfeatures)
+   # initialize parameters
+   h₁ = repeat.(Flux.hidden(lstmcells[1]), 1, 1)
+   h₂ = repeat.(Flux.hidden(lstmcells[2]), 1, 1)
+   query   = gpu(zeros(Float32, dims.query, 0))
+   weights = gpu(zeros(Float32, 0, 1, 0))
+   frame   = gpu(zeros(Float32, dims.melfeatures, 0))
+   state = (h₁, h₂, query, weights, weights, frame)
+   Decoder(attention, prenet, lstmcells, frameproj, (h₁, h₂), State(state))
+end
+
+function Flux.reset!(m::Decoder)
+   typeofdecoder = typeof(m)
+   error("$typeofdecoder cannot be reset without information about input dimensions (batch size and its character length). Consider using reset!(m::Decoder, (time_in, batchsize)::NTuple{2,Integer}) or reset!(m::Decoder, input::DenseMatrix) instead.")
+end
+
+Flux.reset!(m::Decoder, input::DenseMatrix) = Flux.reset!(m, size(input))
+function Flux.reset!(m::Decoder, (time_in, batchsize)::NTuple{2,Integer})
+   #initialize dimensions
+   querydim = size(m.attention.dense.W, 2)
+   nmelfeatures = length(m.frameproj.b)
+   # initialize parameters
+   h₁      = repeat.(m.lstmstate₀[1], 1, batchsize)
+   h₂      = repeat.(m.lstmstate₀[2], 1, batchsize)
+   query   = gpu(zeros(Float32, querydim, batchsize))
+   weights = gpu(zeros(Float32, time_in, 1, batchsize))
+   frame   = gpu(zeros(Float32, nmelfeatures, batchsize))
+   m.state.h = (h₁, h₂, query, weights, weights, frame)
+end
+
+function Base.show(io::IO, m::Decoder)
+   print(io, """Decoder(
+                   $(m.attention),
+                   $(m.prenet),
+                   $(m.lstmcells),
+                   $(m.frameproj)
+                )""")
+end
+
+function (m::Decoder)(values::T, keys::T) where {T <: Array{<:Real,3}}
+   (h₁, h₂, query, weights, Σweights, frame) = m.state.h
+   context, weights = m.attention(values, keys, query, weights, Σweights)
+   Σweights += weights
+   prenetoutput = m.prenet(frame)
+   prenetoutput_context = [prenetoutput; context]
+   h₁, y₁ = m.lstmcells[1](h₁, prenetoutput_context)
+   h₂, query = m.lstmcells[2](h₂, y₁)
+   query_context = [query; context]
+   frame = m.frameproj(query_context)
+   m.state.h = (h₁, h₂, query, weights, Σweights, frame)
+   return frame, query_context
+end
+
+###
+struct Tacotron₂{T₃ <: Array{<:Real,3}, M <: DenseMatrix, V <: DenseVector, D <: Dense, C₃ <: Chain, C₅ <: Chain}
+   che        :: CharEmbedding{M}
    convblock₃ :: C₃
-   blstm      :: B
-   attention  :: A
-   prenet     :: P
-   lstms      :: L
-   frameproj  :: D₁
-   stopproj   :: D₂
+   blstm      :: BLSTM{M, V}
+   decoder    :: Decoder{V, M, T₃, D}
+   stopproj   :: Dense{typeof(identity), M, V}
    postnet    :: C₅
 end
 
@@ -216,13 +292,9 @@ function Tacotron₂(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_
    convblock₃ = Chain(reduce(vcat, map(_ -> convblock(dims.encoding=>dims.encoding, leakyrelu, filtersizes.encoding, pdrops.encoding), 1:3))...) |> gpu
    blstm = BLSTM(dims.encoding, dims.encoding÷2)
 
-   attention = LocationAwareAttention(dims.encoding, dims.location_feature, dims.attention, dims.query, filtersizes.attention)
-   prenet = PreNet(dims.melfeatures, dims.prenet, pdrops.prenet)
-   lstms = Chain(LSTM(dims.prenet + dims.encoding, dims.query), LSTM(dims.query, dims.query))
-
-   frameproj = Dense(dims.query + dims.encoding, dims.melfeatures)
+   decoder = Decoder(dims, filtersizes, pdrops)
    # will apply sigmoid implicitly during loss calculation with logitbinarycrossentropy for numerical stability
-   stopproj = Dense(dims.query + dims.encoding, 1 #=, σ =#)
+   stopproj = Dense(dims.query + dims.encoding, 1#=, σ=#)
 
    nchmel, nch, fs, pdrop = dims.melfeatures, dims.postnet, filtersizes.postnet, pdrops.postnet
    postnet = Chain([convblock(nchmel=>nch, tanh, fs, pdrop);
@@ -230,7 +302,7 @@ function Tacotron₂(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_
                     convblock(nch=>nch, tanh, fs, pdrop);
                     convblock(nch=>nch, tanh, fs, pdrop);
                     convblock(nch=>nchmel, identity, fs, pdrop)]...)
-   Tacotron₂(che, convblock₃, blstm, attention, prenet, lstms, frameproj, stopproj, postnet)
+   Tacotron₂(che, convblock₃, blstm, decoder, stopproj, postnet)
 end
 
 function Tacotron₂(alphabet,
@@ -242,66 +314,47 @@ function Tacotron₂(alphabet,
    Tacotron₂(dims, filtersizes, pdrops)
 end
 
+function Flux.reset!(m::Tacotron₂)
+   error("Tacotron₂ cannot be reset without information about input dimensions (batch size and its character length). Consider using reset!(m::Tacotron₂, time_in′batchsize::NTuple{2,Integer}) or reset!(m::Tacotron₂, input::DenseMatrix) instead.")
+end
+
+Flux.reset!(m::Tacotron₂, input::DenseMatrix) = Flux.reset!(m::Tacotron₂, size(input))
+function Flux.reset!(m::Tacotron₂, time_in′batchsize::NTuple{2,Integer})
+   Flux.reset!(m.blstm)
+   Flux.reset!(m.decoder, time_in′batchsize)
+end
+
 function Base.show(io::IO, m::Tacotron₂)
    print(io, """Tacotron₂(
                    $(m.che),
                    $(m.convblock₃),
                    $(m.blstm),
-                   $(m.attention),
-                   $(m.prenet),
-                   $(m.lstms),
-                   $(m.frameproj),
+                   $(m.decoder),
                    $(m.stopproj),
                    $(m.postnet)
                 )""")
 end
 
-function Flux.reset!(m::Tacotron₂)
-   Flux.reset!(m.blstm)
-   Flux.reset!(m.lstms)
-end
-
-function (m::Tacotron₂)(textindices::DenseMatrix{<:Integer}, time_out::Integer)
+function (m::Tacotron₂{T₃})(textindices::DenseMatrix{<:Integer}, time_out::Integer) where T₃ <: DenseArray{<:Real,3}
    # dimensions
-   time_in, batchsize = size(textindices)
-   querydim = size(m.attention.dense.W, 2)
-   nmelfeatures = length(m.frameproj.b)
-   # initialize parameters
-   query₀    = gpu(zeros(Float32, querydim, batchsize))
-   weights₀  = gpu(zeros(Float32, time_in, 1, batchsize))
-   Σweights₀ = weights₀
-   frame₀    = gpu(zeros(Float32, nmelfeatures, batchsize))
-   return m(textindices, time_out, query₀, weights₀, Σweights₀, frame₀)
-end
-
-function (m::Tacotron₂)(textindices::DenseMatrix{<:Integer}, time_out::Integer, query::M, weights::T₃, Σweights::T₃, frame::M) where {M <: DenseMatrix, T₃ <: DenseArray{<:Real,3}}
+   batchsize = size(textindices, 2)
+   nmelfeatures = length(m.decoder.frameproj.b)
    # encoding stage
    chex = m.che(textindices)
    convblock₃x = m.convblock₃(chex)::T₃
    values = m.blstm(convblock₃x)
    # @ein keys[a,t,b] := m.attention.V[a,d] * values[d,t,b] # dispatches to batched_contract (vetted)
-   keys = einsum(EinCode{((1,2), (2,3,4)), (1,3,4)}(), (m.attention.V, values))::T₃
-   # #=check=# Vh ≈ reduce(hcat, [reshape(m.V * values[:,t,:], size(m.V,1), 1, :) for t ∈ axes(values,2)])
-   # preallocate output buffer
-   nmelfeatures, batchsize = size(frame)
-   prediction = Buffer(keys, nmelfeatures, batchsize, time_out)
-   σ⁻¹stoprobs′ = Buffer(frame, batchsize, time_out)
-   # main autoregressive loop
-   for t ∈ 1:time_out
-      context, weights = m.attention(values, keys, query, weights, Σweights)::Tuple{M,T₃}
-      Σweights += weights
-      prenetoutput = m.prenet(frame)
-      prenetoutput_context = [prenetoutput; context]
-      query = m.lstms(prenetoutput_context)::M
-      query_context = [query; context]
-      frame = m.frameproj(query_context)
-      σ⁻¹pstopᵀ = m.stopproj(query_context)
-      σ⁻¹stoprobs′[:,t] = reshape(σ⁻¹pstopᵀ, Val(1))
-      prediction[:,:,t] = frame
-   end
-   σ⁻¹stoprobs = copy(σ⁻¹stoprobs′)
-   melprediction = permutedims(copy(prediction), (3,1,2))
-   melprediction⁺residual = melprediction + m.postnet(melprediction)::T₃
+   keys = einsum(EinCode{((1,2), (2,3,4)), (1,3,4)}(), (m.decoder.attention.V, values))::T₃
+   # #=check=# Vh ≈ reduce(hcat, [reshape(m.decoder.attention.V * values[:,t,:], size(m.V,1), 1, :) for t ∈ axes(values,2)])
+   decodings = (_ -> m.decoder(values, keys)).(1:time_out)
+   frames = first.(decodings)
+   query_contexts = last.(decodings)
+   σ⁻¹stoprobs = reshape(m.stopproj(reduce(hcat, query_contexts)), (batchsize, time_out))
+   # #=check=# σ⁻¹stoprobs == reduce(hcat, reshape.(m.stopproj.(query_contexts), Val(1)))
+   prediction = reshape(reduce(hcat, frames), (nmelfeatures, batchsize, time_out))
+   # #=check=# prediction == cat(frames...; dims=3)
+   melprediction = permutedims(prediction, (3,1,2))
+   melprediction⁺residual = melprediction + m.postnet(melprediction)
    return melprediction, melprediction⁺residual, σ⁻¹stoprobs
 end
 
@@ -345,5 +398,3 @@ Juno.@profiler gradient(θ) do
 end
 
 # TODO count parameters, to ensure all are included
-
-batched_mul
