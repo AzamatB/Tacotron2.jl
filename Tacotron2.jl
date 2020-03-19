@@ -34,7 +34,7 @@ end
 function (m::CharEmbedding)(indices::DenseMatrix{<:Integer})
    time, batchsize = size(indices)
    embeddingdim = size(m.embedding, 1)
-   output = permutedims(reshape(m.embedding[:,reshape(indices, Val(1))], embeddingdim, time, batchsize), (2,1,3))
+   output = batched_adjoint(reshape(m.embedding[:,reshape(indices, Val(1))], (embeddingdim, time, batchsize)))
    # #=check=# output == permutedims(cat(map(eachcol(indices)) do indicesᵢ
    #    m.embedding[:,indicesᵢ]
    # end...; dims=3), (2,1,3))
@@ -112,8 +112,8 @@ end
 # Flux.reset!(m::BLSTM) = reset!((m.forward, m.backward)) # not needed as taken care of by @functor
 
 ###
-struct LocationAwareAttention{T <: DenseArray{<:Real,3}, M <: DenseMatrix, V <: DenseVector, D <: Dense}
-   dense :: D # W & b
+struct LocationAwareAttention{T <: DenseArray{<:Real,3}, M <: DenseMatrix, V <: DenseVector}
+   dense :: Dense{typeof(identity), M, V} # W & b
    pad   :: NTuple{2,Int}
    F :: T
    U :: M
@@ -168,7 +168,7 @@ function (m::LocationAwareAttention)(values::T, keys::T, query::M, weights_cat::
 end
 
 ###
-struct PreNet{D<:Dense}
+struct PreNet{D <: Dense}
    dense₁ :: D
    dense₂ :: D
    pdrop  :: Float32
@@ -317,7 +317,6 @@ end
 loss(model::Tacotron₂, (textindices, meltarget, stoptarget)::Tuple{DenseMatrix{<:Integer}, DenseArray{<:Real,3}, DenseMatrix{<:Real}}) = loss(model, textindices, meltarget, stoptarget)
 
 ###
-
 datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
 metadatapath = joinpath(datadir, "metadata.csv")
 melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
@@ -325,21 +324,26 @@ melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
 batchsize = 11
 batches, alphabet = build_batches(metadatapath, melspectrogramspath, batchsize)
 batch = batches[argmin(map(x -> size(last(x), 2), batches))]
-
 textindices, meltarget, stoptarget = batch
 time_out = size(stoptarget, 2)
 
 
 m = Tacotron₂(alphabet)
 
-@time loss(m, batch)
+Flux.reset!(m, textindices)
+
+@time loss(m, textindices, meltarget, stoptarget)
 
 θ = Flux.params(m)
 
 @time gs = gradient(θ) do
-   loss(m, batch)
+   loss(m, textindices, meltarget, stoptarget)
 end
 
 Juno.@profiler gradient(θ) do
    loss(m, batch)
 end
+
+# TODO count parameters, to ensure all are included
+
+batched_mul
