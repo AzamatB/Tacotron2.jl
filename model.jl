@@ -101,14 +101,12 @@ end
 ###
 struct LocationAwareAttention{T <: DenseArray{<:Real,3}, M <: DenseMatrix, V <: DenseVector}
    dense :: Dense{typeof(identity), M, V} # W & b
-   pad   :: NTuple{2,Int}
    F :: T
    U :: M
    V :: M
    w :: V
 end
 
-Flux.trainable(m::LocationAwareAttention) = (m.dense, m.F, m.U, m.V, m.w)
 @functor LocationAwareAttention
 
 function LocationAwareAttention(encodingdim=512, location_featuredim=32, attentiondim=128, querydim=1024, filtersize=31)
@@ -118,7 +116,7 @@ function LocationAwareAttention(encodingdim=512, location_featuredim=32, attenti
    denseU = Dense(location_featuredim, attentiondim)
    denseV = Dense(encodingdim, attentiondim)
    densew = Dense(attentiondim, 1)
-   LocationAwareAttention(dense, convF.pad, convF.weight, denseU.W, denseV.W, vec(densew.W)) |> gpu
+   LocationAwareAttention(dense, convF.weight, denseU.W, denseV.W, vec(densew.W)) |> gpu
 end
 
 function Base.show(io::IO, m::LocationAwareAttention)
@@ -131,7 +129,8 @@ end
 function (m::LocationAwareAttention)(values::T, keys::T, query::DenseMatrix, lastweights::T, Σweights::T) where T <: DenseArray{<:Real,3}
    # weights_cat = cat(lastweights, Σweights; dims=2)::T
    weights_cat = [lastweights Σweights]::T
-   cdims = DenseConvDims(weights_cat, m.F; padding=m.pad)
+   pad = (size(convF.weight,1) - 1) ÷ 2
+   cdims = DenseConvDims(weights_cat, m.F; padding=pad)
    return m(values, keys, query, weights_cat, cdims)
 end
 function (m::LocationAwareAttention)(values::T, keys::T, query::M, weights_cat::T, cdims::DenseConvDims) where {M <: DenseMatrix, T <: DenseArray{<:Real,3}}
