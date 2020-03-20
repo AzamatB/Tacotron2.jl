@@ -19,10 +19,10 @@ end
 
 @functor CharEmbedding
 
-CharEmbedding(alphabetsize::Integer, embeddingdim=512) = CharEmbedding(gpu(Dense(alphabetsize, embeddingdim).W))
+CharEmbedding(alphabetsize::Integer, embeddingdim=512) = CharEmbedding(Dense(alphabetsize, embeddingdim).W) |> gpu
 function CharEmbedding(alphabet, embeddingdim=512)
    alphabetsize = length(alphabet)
-   CharEmbedding(alphabetsize, embeddingdim)
+   CharEmbedding(alphabetsize, embeddingdim) |> gpu
 end
 
 function Base.show(io::IO, m::CharEmbedding)
@@ -49,7 +49,7 @@ function convblock(nchannels::Pair{<:Integer,<:Integer} = (512=>512),
    # "The convolutional layers in the network are regularized using dropout with probability 0.5"
    [Conv((filtersize,), nchannels; pad=pad, kwargs...),
     BatchNorm(last(nchannels), σ),
-    Dropout(pdrop)] |> gpu
+    Dropout(pdrop)]
 end
 
 ###
@@ -70,7 +70,7 @@ Flux.trainable(m::BLSTM) = (m.forward, m.backward)
 function BLSTM(in::Integer, out::Integer)
    forward  = LSTM(in, out)
    backward = LSTM(in, out)
-   return BLSTM(gpu(forward), gpu(backward), out)
+   return BLSTM(forward, backward, out) |> gpu
 end
 
 function Base.show(io::IO, m::BLSTM)
@@ -131,7 +131,7 @@ function LocationAwareAttention(encodingdim=512, location_featuredim=32, attenti
    denseU = Dense(location_featuredim, attentiondim)
    denseV = Dense(encodingdim, attentiondim)
    densew = Dense(attentiondim, 1)
-   LocationAwareAttention(gpu(dense), convF.pad, gpu(convF.weight), gpu(denseU.W), gpu(denseV.W), gpu(vec(densew.W)))
+   LocationAwareAttention(dense, convF.pad, convF.weight, denseU.W, denseV.W, vec(densew.W)) |> gpu
 end
 
 function Base.show(io::IO, m::LocationAwareAttention)
@@ -179,7 +179,7 @@ Flux.trainable(m::PreNet) = (m.dense₁, m.dense₂)
 
 function PreNet(in::Integer, out::Integer=256, pdrop=0.5f0, σ=leakyrelu)
    @assert 0 < pdrop < 1
-   PreNet(Dense(in, out, σ) |> gpu, Dense(out, out, σ) |> gpu, Float32(pdrop))
+   PreNet(Dense(in, out, σ), Dense(out, out, σ), Float32(pdrop)) |> gpu
 end
 
 function Base.show(io::IO, m::PreNet)
@@ -215,18 +215,18 @@ trainable(m::Decoder) = (m.attention, m.prenet, m.lstmcells, m.frameproj, m.lstm
 @functor Decoder
 
 function Decoder(dims, filtersizes, pdrops)
-   attention = LocationAwareAttention(dims.encoding, dims.location_feature, dims.attention, dims.query, filtersizes.attention) |> gpu
+   attention = LocationAwareAttention(dims.encoding, dims.location_feature, dims.attention, dims.query, filtersizes.attention)
    prenet = PreNet(dims.melfeatures, dims.prenet, pdrops.prenet)
-   lstmcells = (LSTMCell(dims.prenet + dims.encoding, dims.query), LSTMCell(dims.query, dims.query)) |> gpu
+   lstmcells = (LSTMCell(dims.prenet + dims.encoding, dims.query), LSTMCell(dims.query, dims.query))
    frameproj = Dense(dims.query + dims.encoding, dims.melfeatures)
    # initialize parameters
    h₁ = repeat.(Flux.hidden(lstmcells[1]), 1, 1)
    h₂ = repeat.(Flux.hidden(lstmcells[2]), 1, 1)
-   query   = gpu(zeros(Float32, dims.query, 0))
-   weights = gpu(zeros(Float32, 0, 1, 0))
-   frame   = gpu(zeros(Float32, dims.melfeatures, 0))
+   query   = zeros(Float32, dims.query, 0)
+   weights = zeros(Float32, 0, 1, 0)
+   frame   = zeros(Float32, dims.melfeatures, 0)
    state = (h₁, h₂, query, weights, weights, frame)
-   Decoder(attention, prenet, lstmcells, frameproj, (h₁, h₂), State(state))
+   Decoder(attention, prenet, lstmcells, frameproj, (h₁, h₂), State(state)) |> gpu
 end
 
 function Flux.reset!(m::Decoder)
@@ -289,7 +289,7 @@ function Tacotron₂(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_
    @assert iseven(dims.encoding)
 
    che = CharEmbedding(dims.alphabet, dims.encoding)
-   convblock₃ = Chain(reduce(vcat, map(_ -> convblock(dims.encoding=>dims.encoding, leakyrelu, filtersizes.encoding, pdrops.encoding), 1:3))...) |> gpu
+   convblock₃ = Chain(reduce(vcat, map(_ -> convblock(dims.encoding=>dims.encoding, leakyrelu, filtersizes.encoding, pdrops.encoding), 1:3))...)
    blstm = BLSTM(dims.encoding, dims.encoding÷2)
 
    decoder = Decoder(dims, filtersizes, pdrops)
