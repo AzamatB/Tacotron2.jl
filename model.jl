@@ -21,7 +21,7 @@ end
 function (m::CharEmbedding)(indices::DenseMatrix{<:Integer})
    time, batchsize = size(indices)
    embeddingdim = size(m.embedding, 1)
-   output = batched_adjoint(reshape(m.embedding[:,reshape(indices, Val(1))], (embeddingdim, time, batchsize)))
+   output = permutedims(reshape(m.embedding[:,reshape(indices, Val(1))], embeddingdim, time, batchsize), (2,1,3))
    # #=check=# output == permutedims(cat(map(eachcol(indices)) do indicesᵢ
    #    m.embedding[:,indicesᵢ]
    # end...; dims=3), (2,1,3))
@@ -32,7 +32,7 @@ function convblock(nchannels::Pair{<:Integer,<:Integer} = (512=>512),
                    σ = identity,
                    filtersize::Integer = 5,
                    pdrop = 0.5f0;
-                   pad = (filtersize-1,0), kwargs...)
+                   pad = (filtersize-1)÷2, kwargs...)
    # "The convolutional layers in the network are regularized using dropout with probability 0.5"
    [Conv((filtersize,), nchannels; pad=pad, kwargs...),
     BatchNorm(last(nchannels), σ),
@@ -204,15 +204,15 @@ Flux.trainable(m::Decoder) = (m.attention, m.prenet, m.lstmcells, m.frameproj, m
 function Decoder(dims, filtersizes, pdrops)
    attention = LocationAwareAttention(dims.encoding, dims.location_feature, dims.attention, dims.query, filtersizes.attention)
    prenet = PreNet(dims.melfeatures, dims.prenet, pdrops.prenet)
-   lstmcells = (LSTMCell(dims.prenet + dims.encoding, dims.query), LSTMCell(dims.query, dims.query))
-   frameproj = Dense(dims.query + dims.encoding, dims.melfeatures)
+   lstmcells = (LSTMCell(dims.prenet + dims.encoding, dims.query), LSTMCell(dims.query, dims.query)) |> gpu
+   frameproj = Dense(dims.query + dims.encoding, dims.melfeatures) |> gpu
    # initialize parameters
-   h₁ = repeat.(Flux.hidden(lstmcells[1]), 1, 1)
-   h₂ = repeat.(Flux.hidden(lstmcells[2]), 1, 1)
+   h₁ = repeat.(Flux.hidden(lstmcells[1]), 1, 1) |> gpu
+   h₂ = repeat.(Flux.hidden(lstmcells[2]), 1, 1) |> gpu
    query   = zeros(Float32, dims.query, 0)
    weights = zeros(Float32, 0, 1, 0)
    frame   = zeros(Float32, dims.melfeatures, 0)
-   state = (h₁, h₂, query, weights, weights, frame)
+   state = (h₁, h₂, query, weights, weights, frame) |> gpu
    Decoder(attention, prenet, lstmcells, frameproj, (h₁, h₂), State(state)) |> gpu
 end
 
@@ -259,7 +259,7 @@ function (m::Decoder)(values::T, keys::T) where {T <: Array{<:Real,3}}
 end
 
 ###
-struct Tacotron₂{T₃ <: Array{<:Real,3}, M <: DenseMatrix, V <: DenseVector, D <: Dense, C₃ <: Chain, C₅ <: Chain}
+struct Tacotron₂{T₃ <: DenseArray{<:Real,3}, M <: DenseMatrix, V <: DenseVector, D <: Dense, C₃ <: Chain, C₅ <: Chain}
    che        :: CharEmbedding{M}
    convblock₃ :: C₃
    blstm      :: BLSTM{M, V}
@@ -281,7 +281,7 @@ function Tacotron₂(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_
 
    decoder = Decoder(dims, filtersizes, pdrops)
    # will apply sigmoid implicitly during loss calculation with logitbinarycrossentropy for numerical stability
-   stopproj = Dense(dims.query + dims.encoding, 1#=, σ=#)
+   stopproj = Dense(dims.query + dims.encoding, 1#=, σ=#) |> gpu
 
    nchmel, nch, fs, pdrop = dims.melfeatures, dims.postnet, filtersizes.postnet, pdrops.postnet
    postnet = Chain([convblock(nchmel=>nch, tanh, fs, pdrop);

@@ -11,17 +11,18 @@ CuArrays.allowscalar(false)
 
 include("utils.jl")
 include("dataprepLJSpeech/dataprep.jl")
+include("model.jl")
 
 ###
-datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
+datadir = "/home/azamat/Projects/TTS/LJSpeech-1.1"
 metadatapath = joinpath(datadir, "metadata.csv")
 melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
 
-batch = batches[argmin(map(x -> size(last(x), 2), batches))]
+batch = batches_trn[argmin(map(x -> size(last(x), 2), batches_trn))]
 textindices, meltarget, stoptarget = batch
 time_out = size(stoptarget, 2)
 
-batchsize = 32
+batchsize = 11
 batches_trn, alphabet = build_batches(metadatapath, melspectrogramspath, batchsize)
 
 
