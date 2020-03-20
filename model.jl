@@ -1,16 +1,3 @@
-using CuArrays
-using Flux
-using Flux: @functor, Recur, LSTMCell, dropout, mse, logitbinarycrossentropy
-using Zygote
-using Zygote: Buffer
-using OMEinsum
-using NamedTupleTools
-using Statistics
-
-CuArrays.allowscalar(false)
-
-include("utils.jl")
-include("dataprepLJSpeech/dataprep.jl")
 
 ###
 struct CharEmbedding{M <: DenseMatrix}
@@ -197,7 +184,7 @@ mutable struct State{M <: DenseMatrix, T₃ <: DenseArray{<:Real,3}}
    h::Tuple{NTuple{2,M}, NTuple{2,M}, M, T₃, T₃, M}
 end
 
-trainable(m::State) = ()
+Flux.trainable(m::State) = ()
 
 @functor State
 
@@ -210,7 +197,7 @@ struct Decoder{V <: DenseVector, M <: DenseMatrix, T₃ <: DenseArray{<:Real,3},
    state      :: State{M, T₃}
 end
 
-trainable(m::Decoder) = (m.attention, m.prenet, m.lstmcells, m.frameproj, m.lstmstate₀)
+Flux.trainable(m::Decoder) = (m.attention, m.prenet, m.lstmcells, m.frameproj, m.lstmstate₀)
 
 @functor Decoder
 
@@ -302,7 +289,7 @@ function Tacotron₂(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_
                     convblock(nch=>nch, tanh, fs, pdrop);
                     convblock(nch=>nch, tanh, fs, pdrop);
                     convblock(nch=>nchmel, identity, fs, pdrop)]...)
-   Tacotron₂(che, convblock₃, blstm, decoder, stopproj, postnet)
+   Tacotron₂(che, convblock₃, blstm, decoder, stopproj, postnet) |> gpu
 end
 
 function Tacotron₂(alphabet,
@@ -354,7 +341,7 @@ function (m::Tacotron₂{T₃})(textindices::DenseMatrix{<:Integer}, time_out::I
    prediction = reshape(reduce(hcat, frames), (nmelfeatures, batchsize, time_out))
    # #=check=# prediction == cat(frames...; dims=3)
    melprediction = permutedims(prediction, (3,1,2))
-   melprediction⁺residual = melprediction + m.postnet(melprediction)
+   melprediction⁺residual = melprediction + m.postnet(melprediction)::T₃
    return melprediction, melprediction⁺residual, σ⁻¹stoprobs
 end
 
@@ -368,33 +355,3 @@ function loss(model::Tacotron₂, textindices::DenseMatrix{<:Integer}, meltarget
 end
 
 loss(model::Tacotron₂, (textindices, meltarget, stoptarget)::Tuple{DenseMatrix{<:Integer}, DenseArray{<:Real,3}, DenseMatrix{<:Real}}) = loss(model, textindices, meltarget, stoptarget)
-
-###
-datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
-metadatapath = joinpath(datadir, "metadata.csv")
-melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
-
-batchsize = 11
-batches, alphabet = build_batches(metadatapath, melspectrogramspath, batchsize)
-batch = batches[argmin(map(x -> size(last(x), 2), batches))]
-textindices, meltarget, stoptarget = batch
-time_out = size(stoptarget, 2)
-
-
-m = Tacotron₂(alphabet)
-
-Flux.reset!(m, textindices)
-
-@time loss(m, textindices, meltarget, stoptarget)
-
-θ = Flux.params(m)
-
-@time gs = gradient(θ) do
-   loss(m, textindices, meltarget, stoptarget)
-end
-
-Juno.@profiler gradient(θ) do
-   loss(m, batch)
-end
-
-# TODO count parameters, to ensure all are included
