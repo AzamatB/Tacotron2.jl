@@ -1,12 +1,24 @@
 using Zygote: @adjoint
 
+addparent(A::Type{<:AbstractArray}, P′::DataType = A) = A
+addparent(A::Type{CuArray{T,N,Nothing}}, P′::DataType = A) where {T,N} = CuArray{T,N,P′}
+addparent(A::Type{CuArray{T,N,P}}, P′::DataType) where {T,N,P} = CuArray{T,N,P′}
+
 vectorof(::Type{<:Array{T}}) where T = Vector{T}
 matrixof(::Type{<:Array{T}}) where T = Matrix{T}
 tensor₃of(::Type{<:Array{T}}) where T = Array{T,3}
 
-vectorof(::Type{<:CuArray{T}}) where T = CuVector{T,Nothing}
-matrixof(::Type{<:CuArray{T}}) where T = CuMatrix{T,Nothing}
-tensor₃of(::Type{<:CuArray{T}}) where T = CuArray{T,3,Nothing}
+vectorof(::Array{T}) where T = Vector{T}
+matrixof(::Array{T}) where T = Matrix{T}
+tensor₃of(::Array{T}) where T = Array{T,3}
+
+vectorof(::Type{CuArray{T,N,P}}) where {T,N,P} = CuVector{T,P}
+matrixof(::Type{CuArray{T,N,P}}) where {T,N,P} = CuMatrix{T,P}
+tensor₃of(::Type{CuArray{T,N,P}}) where {T,N,P} = CuArray{T,3,P}
+
+vectorof(::CuArray{T,N,P}) where {T,N,P} = CuVector{T,P}
+matrixof(::CuArray{T,N,P}) where {T,N,P} = CuMatrix{T,P}
+tensor₃of(::CuArray{T,N,P}) where {T,N,P} = CuArray{T,3,P}
 
 function Flux.dropout(x, p)
    q = 1 - p
