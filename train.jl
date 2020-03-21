@@ -18,13 +18,13 @@ datadir = "/home/azamat/Projects/TTS/LJSpeech-1.1"
 metadatapath = joinpath(datadir, "metadata.csv")
 melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
 
-batchsize = 11
+batchsize = 92
 batches_trn, alphabet = build_batches(metadatapath, melspectrogramspath, batchsize)
 
 batch = batches_trn[argmin(map(x -> size(last(x), 2), batches_trn))]
 textindices, meltarget, stoptarget = batch
+meltarget, stoptarget = meltarget |> gpu, stoptarget |> gpu
 time_out = size(stoptarget, 2)
-
 
 m = Tacotron₂(alphabet)
 

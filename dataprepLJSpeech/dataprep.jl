@@ -50,7 +50,7 @@ function pad_batch(batch::AbstractVector{<:Tuple{String,DenseMatrix{Float32}}}, 
    end
    (time, nmelfeatures, batchsize) = size(melspectrograms)
    melspectrograms⁴ = reshape(melspectrograms, (time, 1, nmelfeatures, batchsize))
-   return textindices, gpu(melspectrograms⁴), gpu(stoptarget)
+   return textindices, melspectrograms⁴, stoptarget
 end
 
 function build_dataset(metadatapath::AbstractString, melspectrogramspath::AbstractString; eos='~', pad='_')

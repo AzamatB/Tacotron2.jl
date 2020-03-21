@@ -1,5 +1,4 @@
 
-###
 struct CharEmbedding{M <: DenseMatrix}
    embedding :: M
 end
@@ -131,24 +130,27 @@ function Base.show(io::IO, m::LocationAwareAttention)
    print(io, "LocationAwareAttention($encodingdim, $location_featuredim, $attentiondim, $querydim)")
 end
 
-function (m::LocationAwareAttention)(values::T, keys::DenseArray{<:Real,3}, query::DenseMatrix, lastweights::T, Σweights::T) where T <: DenseArray{<:Real,3}
-   # weights_cat = cat(lastweights, Σweights; dims=2)::T
-   weights_cat = [lastweights Σweights]::T
-   time, channel, batchsize = size(weights_cat)
-   weights_cat⁴ = reshape(weights_cat, (time, 1, channel, batchsize))
+function (m::LocationAwareAttention)(values::T, keys::DenseArray{<:Real,3}, query::M, lastweights::M, Σweights::M) where {M <: DenseMatrix, T <: DenseArray{<:Real,3}}
+   time, batchsize = size(lastweights)
+   rdims = (time, 1, batchsize)
+   lastweights³ = reshape(lastweights, rdims)
+   Σweights³ = reshape(Σweights, rdims)
+   weights_cat³ = [lastweights³ Σweights³]::T
+   weights_cat⁴ = reshape(weights_cat³, (time, 1, 2, batchsize))
    pad = ((size(m.F, 1) - 1) ÷ 2, 0)
    cdims = DenseConvDims(weights_cat⁴, m.F; padding=pad)
    return m(values, keys, query, weights_cat⁴, cdims)
 end
+
 function (m::LocationAwareAttention{M₃})(values::DenseArray{<:Real,3}, keys::T₃₃, query::DenseMatrix, weights_cat⁴::DenseArray{<:Real,4}, cdims::DenseConvDims) where {M₃ <: DenseMatrix, T₃₃ <: DenseArray{<:Real,3}}
    # location features
    fs = dropdims(conv(weights_cat⁴, m.F, cdims); dims=2) # F✶weights_cat
    # @ein Uf[a,t,b] := m.U[a,c] * fs[t,c,b] # dispatches to batched_contract (vetted)
    Uf = einsum(EinCode{((1,2), (3,2,4)), (1,3,4)}(), (m.U, fs))::T₃₃
    # #=check=# Uf ≈ reduce(hcat, [reshape(m.U * fs[t,:,:], size(m.U,1), 1, :) for t ∈ axes(fs,1)])
-   _, time, batchsize = size(values)
    attentiondim = length(m.w)
-   Ws⁺b = reshape(m.dense(query), attentiondim, 1, batchsize) # (a -> b) & (t -> c -> b)
+   batchsize = size(values, 3)
+   Ws⁺b = reshape(m.dense(query), (attentiondim, 1, batchsize)) # (a -> b) & (t -> c -> b)
    tanhWs⁺Vh⁺Uf⁺b = tanh.(Ws⁺b .+ keys .+ Uf)
    # @ein energies[t,b] := m.w[a] * tanhWs⁺Vh⁺Uf⁺b[a,t,b] # dispatches to batched_contract (vetted)
    energies = einsum(EinCode{((1,), (1,2,3)), (2,3)}(), (m.w, tanhWs⁺Vh⁺Uf⁺b))::M₃
@@ -157,7 +159,7 @@ function (m::LocationAwareAttention{M₃})(values::DenseArray{<:Real,3}, keys::T
    # @ein context[d,b] := values[d,t,b] * weights[t,b] # dispatches to batched_contract (vetted)
    context = einsum(EinCode{((1,2,3), (2,3)), (1,3)}(), (values, weights))::M₃
    # #=check=# context ≈ reduce(hcat, [sum(weights[t,b] * values[:,t,b] for t ∈ axes(values,2)) for b ∈ axes(values,3)])
-   return context, reshape(weights, (time, 1, batchsize))
+   return context, weights
 end
 
 ###
@@ -186,38 +188,37 @@ end
 (m::PreNet)(x::DenseVecOrMat) = dropout(m.dense₂(dropout(m.dense₁(x), m.pdrop)), m.pdrop)
 
 ###
-mutable struct State{M <: DenseMatrix, T₃ <: DenseArray{<:Real,3}}
-   h::Tuple{NTuple{2,M}, NTuple{2,M}, M, T₃, T₃, M}
+mutable struct State{M <: DenseMatrix}
+   hs::NTuple{4, M}
 end
 
 Flux.trainable(m::State) = ()
 
 @functor State
 
-struct Decoder{V <: DenseVector, M <: DenseMatrix, M₃ <: DenseMatrix, T₃ <: DenseArray{<:Real,3}, T₄ <: DenseArray{<:Real,4}, D <: Dense}
-   attention  :: LocationAwareAttention{M₃, T₄, M, V}
-   prenet     :: PreNet{D}
-   lstmcells  :: NTuple{2,LSTMCell{M,V}}
-   frameproj  :: Dense{typeof(identity), M, V}
-   lstmstate₀ :: NTuple{2, NTuple{2,M}}
-   state      :: State{M, T₃}
+###
+struct Decoder{V <: DenseVector, M <: DenseMatrix, M₃ <: DenseMatrix, T₄ <: DenseArray{<:Real,4}, D <: Dense}
+   attention :: LocationAwareAttention{M₃, T₄, M, V}
+   prenet    :: PreNet{D}
+   lstms     :: Chain{NTuple{2, Recur{LSTMCell{M, V}}}}
+   frameproj :: Dense{typeof(identity), M, V}
+   state     :: State{M}
 end
 
-@functor Decoder (attention, prenet, lstmcells, frameproj, lstmstate₀)
+Flux.trainable(m::Decoder) = (m.attention, m.prenet, m.lstms, m.frameproj)
+@functor Decoder
 
 function Decoder(dims, filtersizes, pdrops)
    attention = LocationAwareAttention(dims.encoding, dims.location_feature, dims.attention, dims.query, filtersizes.attention)
-   prenet = PreNet(dims.melfeatures, dims.prenet, pdrops.prenet) |> gpu
-   lstmcells = (LSTMCell(dims.prenet + dims.encoding, dims.query), LSTMCell(dims.query, dims.query))
+   prenet = PreNet(dims.melfeatures, dims.prenet, pdrops.prenet)
+   lstms = Chain(LSTM(dims.prenet + dims.encoding, dims.query), LSTM(dims.query, dims.query)) |> gpu
    frameproj = Dense(dims.query + dims.encoding, dims.melfeatures) |> gpu
    # initialize parameters
-   h₁ = repeat.(Flux.hidden(lstmcells[1]), 1, 1)
-   h₂ = repeat.(Flux.hidden(lstmcells[2]), 1, 1)
    query   = zeros(Float32, dims.query, 0)
-   weights = zeros(Float32, 0, 1, 0)
+   weights = zeros(Float32, 0, 0)
    frame   = zeros(Float32, dims.melfeatures, 0)
-   state = State((h₁, h₂, query, weights, weights, frame)) |> gpu
-   Decoder(attention, prenet, lstmcells |> gpu, frameproj, (h₁, h₂) |> gpu, state)
+   state = State((query, weights, weights, frame)) |> gpu
+   Decoder(attention, prenet, lstms, frameproj, state)
 end
 
 function Flux.reset!(m::Decoder)
@@ -227,56 +228,55 @@ end
 
 Flux.reset!(m::Decoder, input::DenseMatrix) = Flux.reset!(m, size(input))
 function Flux.reset!(m::Decoder, (time_in, batchsize)::NTuple{2,Integer})
+   Flux.reset!(m.lstms)
    #initialize dimensions
    querydim = size(m.attention.dense.W, 2)
    nmelfeatures = length(m.frameproj.b)
    # initialize parameters
-   h₁      = repeat.(m.lstmstate₀[1], 1, batchsize)
-   h₂      = repeat.(m.lstmstate₀[2], 1, batchsize)
    query   = gpu(zeros(Float32, querydim, batchsize))
-   weights = gpu(zeros(Float32, time_in, 1, batchsize))
+   weights = gpu(zeros(Float32, time_in, batchsize))
    frame   = gpu(zeros(Float32, nmelfeatures, batchsize))
-   m.state.h = (h₁, h₂, query, weights, weights, frame)
+   m.state.hs = (query, weights, weights, frame)
+   return nothing
 end
 
 function Base.show(io::IO, m::Decoder)
    print(io, """Decoder(
                    $(m.attention),
                    $(m.prenet),
-                   $(m.lstmcells),
+                   $(m.lstms),
                    $(m.frameproj)
                 )""")
 end
 
 function (m::Decoder)(values::DenseArray{<:Real,3}, keys::DenseArray{<:Real,3})
-   (h₁, h₂, query, weights, Σweights, frame) = m.state.h
+   (query, weights, Σweights, frame) = m.state.hs
    context, weights = m.attention(values, keys, query, weights, Σweights)
    Σweights += weights
    prenetoutput = m.prenet(frame)
    prenetoutput_context = [prenetoutput; context]
-   h₁, y₁ = m.lstmcells[1](h₁, prenetoutput_context)
-   h₂, query = m.lstmcells[2](h₂, y₁)
+   query = m.lstms(prenetoutput_context)
    query_context = [query; context]
    frame = m.frameproj(query_context)
-   m.state.h = (h₁, h₂, query, weights, Σweights, frame)
+   m.state.hs = (query, weights, Σweights, frame)
    return frame, query_context
 end
 
 ###
-struct Tacotron₂{T₄ <: DenseArray{<:Real,4}, T₃₃ <: DenseArray{<:Real,3}, T₃ <: DenseArray{<:Real,3}, M <: DenseMatrix, M₃ <: DenseMatrix, V <: DenseVector, D <: Dense, C₃ <: Chain, C₅ <: Chain}
+struct Tacotron₂{T₄ <: DenseArray{<:Real,4}, T₃₃ <: DenseArray{<:Real,3}, M <: DenseMatrix, M₃ <: DenseMatrix, V <: DenseVector, D <: Dense, C₃ <: Chain, C₅ <: Chain}
    che        :: CharEmbedding{M}
    convblock₃ :: C₃
    blstm      :: BLSTM{M, V}
-   decoder    :: Decoder{V, M, M₃, T₃, T₄, D}
+   decoder    :: Decoder{V, M, M₃, T₄, D}
    stopproj   :: Dense{typeof(identity), M, V}
    postnet    :: C₅
 end
 
 @functor Tacotron₂
 
-function Tacotron₂(che::CharEmbedding{M}, convblock₃::C₃, blstm::BLSTM{M,V}, decoder::Decoder{V,M,M₃,T₃,T₄,D}, stopproj::Dense{typeof(identity),M,V}, postnet::C₅) where {T₄ <: DenseArray{<:Real,4}, T₃ <: DenseArray{<:Real,3}, M <: DenseMatrix, M₃ <: DenseMatrix, V <: DenseVector, D <: Dense, C₃ <: Chain, C₅ <: Chain}
-   T₃₃ = addparent(T₃)
-   Tacotron₂{T₄, T₃₃, T₃, M, M₃, V, D, C₃, C₅}(che, convblock₃, blstm, decoder, stopproj, postnet)
+function Tacotron₂(che::CharEmbedding{M}, convblock₃::C₃, blstm::BLSTM{M,V}, decoder::Decoder{V,M,M₃,T₄,D}, stopproj::Dense{typeof(identity),M,V}, postnet::C₅) where {T₄ <: DenseArray{<:Real,4}, M <: DenseMatrix, M₃ <: DenseMatrix, V <: DenseVector, D <: Dense, C₃ <: Chain, C₅ <: Chain}
+   T₃₃ = tensor₃of(M₃)
+   Tacotron₂{T₄, T₃₃, M, M₃, V, D, C₃, C₅}(che, convblock₃, blstm, decoder, stopproj, postnet)
 end
 
 function Tacotron₂(dims::NamedTuple{(:alphabet,:encoding,:attention,:location_feature,:prenet,:query,:melfeatures,:postnet), <:NTuple{8,Integer}},
