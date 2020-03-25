@@ -14,8 +14,8 @@ include("dataprepLJSpeech/dataprep.jl")
 include("model.jl")
 
 ###
-datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
-# datadir = "/home/azamat/Projects/TTS/LJSpeech-1.1"
+# datadir = "/Users/aza/Projects/TTS/data/LJSpeech-1.1"
+datadir = "/home/azamat/Projects/TTS/LJSpeech-1.1"
 metadatapath = joinpath(datadir, "metadata.csv")
 melspectrogramspath = joinpath(datadir, "melspectrograms.jld2")
 

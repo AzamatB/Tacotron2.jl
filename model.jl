@@ -197,7 +197,7 @@ Flux.trainable(m::State) = ()
 @functor State
 
 ###
-struct Decoder{V <: DenseVector, M <: DenseMatrix, M₃ <: DenseMatrix, T₄ <: DenseArray{<:Real,4}, D <: Dense}
+struct Decoder{M <: DenseMatrix, M₃ <: DenseMatrix, V <: DenseVector, T₄ <: DenseArray{<:Real,4}, D <: Dense}
    attention :: LocationAwareAttention{M₃, T₄, M, V}
    prenet    :: PreNet{D}
    lstms     :: Chain{NTuple{2, Recur{LSTMCell{M, V}}}}
@@ -249,14 +249,14 @@ function Base.show(io::IO, m::Decoder)
                 )""")
 end
 
-function (m::Decoder)(values::DenseArray{<:Real,3}, keys::DenseArray{<:Real,3})
+function (m::Decoder{M})(values::DenseArray{<:Real,3}, keys::DenseArray{<:Real,3}) where M <: DenseMatrix
    (query, weights, Σweights, frame) = m.state.hs
    context, weights = m.attention(values, keys, query, weights, Σweights)
    Σweights += weights
    prenetoutput = m.prenet(frame)
-   prenetoutput_context = [prenetoutput; context]
-   query = m.lstms(prenetoutput_context)
-   query_context = [query; context]
+   prenetoutput_context = [prenetoutput; context]::M
+   query = m.lstms(prenetoutput_context)::M
+   query_context = [query; context]::M
    frame = m.frameproj(query_context)
    m.state.hs = (query, weights, Σweights, frame)
    return frame, query_context
@@ -267,14 +267,14 @@ struct Tacotron₂{T₄ <: DenseArray{<:Real,4}, T₃₃ <: DenseArray{<:Real,3}
    che        :: CharEmbedding{M}
    convblock₃ :: C₃
    blstm      :: BLSTM{M, V}
-   decoder    :: Decoder{V, M, M₃, T₄, D}
+   decoder    :: Decoder{M, M₃, V, T₄, D}
    stopproj   :: Dense{typeof(identity), M, V}
    postnet    :: C₅
 end
 
 @functor Tacotron₂
 
-function Tacotron₂(che::CharEmbedding{M}, convblock₃::C₃, blstm::BLSTM{M,V}, decoder::Decoder{V,M,M₃,T₄,D}, stopproj::Dense{typeof(identity),M,V}, postnet::C₅) where {T₄ <: DenseArray{<:Real,4}, M <: DenseMatrix, M₃ <: DenseMatrix, V <: DenseVector, D <: Dense, C₃ <: Chain, C₅ <: Chain}
+function Tacotron₂(che::CharEmbedding{M}, convblock₃::C₃, blstm::BLSTM{M,V}, decoder::Decoder{M,M₃,V,T₄,D}, stopproj::Dense{typeof(identity),M,V}, postnet::C₅) where {T₄ <: DenseArray{<:Real,4}, M <: DenseMatrix, M₃ <: DenseMatrix, V <: DenseVector, D <: Dense, C₃ <: Chain, C₅ <: Chain}
    T₃₃ = tensor₃of(M₃)
    Tacotron₂{T₄, T₃₃, M, M₃, V, D, C₃, C₅}(che, convblock₃, blstm, decoder, stopproj, postnet)
 end
