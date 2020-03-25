@@ -143,13 +143,14 @@ function (m::LocationAwareAttention)(values::T, keys::DenseArray{<:Real,3}, quer
 end
 
 function (m::LocationAwareAttention{M₃})(values::DenseArray{<:Real,3}, keys::T₃₃, query::DenseMatrix, weights_cat⁴::DenseArray{<:Real,4}, cdims::DenseConvDims) where {M₃ <: DenseMatrix, T₃₃ <: DenseArray{<:Real,3}}
+   attentiondim = length(m.w)
+   _, time, batchsize = size(values)
    # location features
    fs = dropdims(conv(weights_cat⁴, m.F, cdims); dims=2) # F✶weights_cat
+   Uf = reshape(m.U * reshape(permutedims(fs, (2,1,3)), Val(2)), (attentiondim, time, batchsize))
    # @ein Uf[a,t,b] := m.U[a,c] * fs[t,c,b] # dispatches to batched_contract (vetted)
-   Uf = einsum(EinCode{((1,2), (3,2,4)), (1,3,4)}(), (m.U, fs))::T₃₃
+   # Uf = einsum(EinCode{((1,2), (3,2,4)), (1,3,4)}(), (m.U, fs))::T₃₃
    # #=check=# Uf ≈ reduce(hcat, [reshape(m.U * fs[t,:,:], size(m.U,1), 1, :) for t ∈ axes(fs,1)])
-   attentiondim = length(m.w)
-   batchsize = size(values, 3)
    Ws⁺b = reshape(m.dense(query), (attentiondim, 1, batchsize)) # (a -> b) & (t -> c -> b)
    tanhWs⁺Vh⁺Uf⁺b = tanh.(Ws⁺b .+ keys .+ Uf)
    # @ein energies[t,b] := m.w[a] * tanhWs⁺Vh⁺Uf⁺b[a,t,b] # dispatches to batched_contract (vetted)
