@@ -56,7 +56,7 @@ Flux.trainable(m::BLSTM) = (m.forward, m.backward)
 function BLSTM(in::Integer, out::Integer)
    forward  = LSTM(in, out)
    backward = LSTM(in, out)
-   return BLSTM(forward, backward, Int(out)) |> gpu
+   return BLSTM(forward, backward, out) |> gpu
 end
 
 function Base.show(io::IO, m::BLSTM)
@@ -80,7 +80,7 @@ function (m::BLSTM)(Xs₄::DenseArray{<:Real,4})
    time_b = reverse(time_f)
    @inbounds begin
       # get forward and backward slice indices
-      slice_f = axisYs₁[begin:m.outdim]
+      slice_f = axisYs₁[1:m.outdim]
       slice_b = axisYs₁[(m.outdim+1):end]
       # bidirectional run step
       setindex!.((Ys,),  m.forward.(view.((Xs,), :, :, time_f)), (slice_f,), time_f, :)
